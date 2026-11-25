@@ -23,12 +23,31 @@ fail() {
 BEAD_ID="${GC_BEAD_ID:-}"
 [ -n "$BEAD_ID" ] || fail "GC_BEAD_ID is required"
 command -v gc >/dev/null 2>&1 || fail "gc is required on PATH"
-command -v python3 >/dev/null 2>&1 || fail "python3 is required on PATH"
+# Interpreters. gc runs gates with HOME=<city root> and a narrow PATH, where
+# python3 is usually the system interpreter without PyYAML. The validator
+# declares its dependency inline (PEP 723), so uv can run it without a
+# preinstalled PyYAML; python3 is the fallback when uv is absent. The inline
+# JSON helpers need only the stdlib: python3 when present, else a uv-managed
+# interpreter. uv's result is authoritative: a failing uv is not retried with
+# python3. --quiet hides uv's progress output but not its errors, so those
+# still reach gc.attempt_log.
+if command -v python3 >/dev/null 2>&1; then
+  INLINE_PY=(python3)
+elif command -v uv >/dev/null 2>&1; then
+  INLINE_PY=(uv run --quiet --no-project python)
+else
+  fail "uv or python3 is required on PATH"
+fi
+if command -v uv >/dev/null 2>&1; then
+  VALIDATOR_RUNNER=(uv run --quiet --script)
+else
+  VALIDATOR_RUNNER=(python3)
+fi
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 metadata_value() {
   # metadata_value <json> <key> -> prints metadata[key] or empty
-  printf '%s' "$1" | python3 -c '
+  printf '%s' "$1" | "${INLINE_PY[@]}" -c '
 import json
 import sys
 
@@ -152,7 +171,7 @@ for candidate in \
 done
 [ -n "$VALIDATOR" ] || fail "validate_build_artifact.py not found beside $SCRIPT_DIR or under GC_WORK_DIR"
 
-if OUTPUT="$(python3 "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" 2>&1)"; then
+if OUTPUT="$("${VALIDATOR_RUNNER[@]}" "$VALIDATOR" --schema "$SCHEMA" --path "$ARTIFACT_PATH" 2>&1)"; then
   echo "build artifact valid: schema=$SCHEMA path=$ARTIFACT_PATH"
   exit 0
 fi

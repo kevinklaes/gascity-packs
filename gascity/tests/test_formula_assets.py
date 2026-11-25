@@ -4,7 +4,9 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import tomllib
 import unittest
@@ -684,6 +686,58 @@ def assert_pack_or_role_route_target(
     test_case.assertTrue(resolved.startswith(prefix), f"{resolved!r} must target {prefix}* or gc.*")
     local_agent = resolved.removeprefix(prefix)
     test_case.assertTrue((pack_root / "agents" / local_agent / "agent.toml").is_file())
+
+
+# External commands build-artifact-valid.sh and its test stubs need on a
+# hermetic PATH. Everything else the wrapper runs is a bash builtin. `rm` runs
+# only in the EXIT trap, so a missing one would leak a temp file silently.
+HERMETIC_CHECK_TOOLS = ("bash", "cat", "dirname", "mktemp", "rm", "tail", "tr")
+
+# uv stub: accepts only the argv shapes the wrapper is specified to use
+# (`run [--quiet] [--no-project] --script <file> ...` and
+# `run [--quiet] [--no-project] python|python3 ...`), then runs the test
+# interpreter, so the uv branch runs offline. Any other shape exits 97.
+UV_STUB_BODY = (
+    "[ \"${1:-}\" = run ] || { echo \"uv stub: unexpected argv: $*\" >&2; exit 97; }\n"
+    "shift\n"
+    "target=\"\"\n"
+    "while [ \"$#\" -gt 0 ]; do\n"
+    "  case \"$1\" in\n"
+    "    --quiet|--no-project) shift ;;\n"
+    "    --script|python|python3) target=\"$1\"; shift; break ;;\n"
+    "    *) break ;;\n"
+    "  esac\n"
+    "done\n"
+    "[ -n \"$target\" ] || { echo \"uv stub: unexpected argv\" >&2; exit 97; }\n"
+    "exec \"@PYTHON@\" \"$@\"\n"
+)
+
+
+def write_argv_logging_stub(path: pathlib.Path, *, log_env: str, body: str) -> None:
+    """Write a bash stub that logs its argv to $<log_env>, then runs `body`.
+
+    Each call is one record: arguments end in \\x1f and the record ends in
+    \\x1e, so a multi-line `-c` program cannot split a call across records.
+    """
+    path.write_text(
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n"
+        f"printf '%s\\037' \"$@\" >>\"${log_env}\"\n"
+        f"printf '\\036' >>\"${log_env}\"\n" + body,
+        encoding="utf-8",
+    )
+    path.chmod(0o755)
+
+
+def read_argv_log(path: pathlib.Path) -> list[list[str]]:
+    """Parse a write_argv_logging_stub log into one argv list per call."""
+    if not path.exists():
+        return []
+    calls = []
+    for record in path.read_text(encoding="utf-8").split("\x1e"):
+        if record:
+            calls.append(record.split("\x1f")[:-1])
+    return calls
 
 
 def write_check_gc_stub(bin_dir: pathlib.Path, *, parent_show: bool = False) -> pathlib.Path:
@@ -4536,7 +4590,25 @@ description = "Override sink that writes the base triage report contract."
         extra_env: dict[str, str] | None = None,
         script_root: pathlib.Path | None = None,
         script: pathlib.Path | None = None,
+        runner: str = "python3",
     ) -> subprocess.CompletedProcess:
+        """Run build-artifact-valid.sh with a hermetic PATH.
+
+        PATH holds only a temp bin dir, so no host uv or python3 can leak in.
+        `runner` picks what that bin dir offers the wrapper:
+
+        - "python3": a python3 shim (the default; today's branch)
+        - "uv": a uv stub and the python3 shim
+        - "uv-only": the uv stub and no python3
+        - "none": neither
+
+        The shim and the stub log each call's argv to their own log, one record
+        per call, and exec the test interpreter (which has PyYAML), so the uv
+        branch runs offline. The result carries the parsed logs as
+        `python_calls` and `uv_calls` (lists of argv lists).
+        """
+        if runner not in {"python3", "uv", "uv-only", "none"}:
+            raise ValueError(f"unknown runner {runner!r}")
         root = pathlib.Path(__file__).resolve().parents[1]
         if script is None:
             script = root / "assets" / "scripts" / "checks" / "build-artifact-valid.sh"
@@ -4575,21 +4647,43 @@ description = "Override sink that writes the base triage report contract."
                 encoding="utf-8",
             )
             fake_gc.chmod(0o755)
+            for tool in HERMETIC_CHECK_TOOLS:
+                resolved = shutil.which(tool)
+                if resolved is None:
+                    self.fail(f"{tool} is required to run the build-artifact check tests")
+                (bin_dir / tool).symlink_to(resolved)
+            python_log = tmp / "python3.argv"
+            uv_log = tmp / "uv.argv"
+            if runner in {"python3", "uv"}:
+                write_argv_logging_stub(
+                    bin_dir / "python3",
+                    log_env="PY_ARGV_LOG",
+                    body=f'exec "{sys.executable}" "$@"\n',
+                )
+            if runner in {"uv", "uv-only"}:
+                write_argv_logging_stub(bin_dir / "uv", log_env="UV_ARGV_LOG", body=UV_STUB_BODY.replace(
+                    "@PYTHON@", sys.executable
+                ))
 
             env = {
                 **os.environ,
-                "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+                "PATH": str(bin_dir),
                 "BD_SHOW_DIR": str(show_dir),
                 "GC_BEAD_ID": bead_id,
+                "PY_ARGV_LOG": str(python_log),
+                "UV_ARGV_LOG": str(uv_log),
                 **(extra_env or {}),
             }
-            return subprocess.run(
+            result = subprocess.run(
                 [str(script)],
                 env=env,
                 text=True,
                 capture_output=True,
                 check=False,
             )
+            result.python_calls = read_argv_log(python_log)
+            result.uv_calls = read_argv_log(uv_log)
+            return result
 
     def _run_implementation_review_check(
         self,
@@ -4991,6 +5085,131 @@ description = "Override sink that writes the base triage report contract."
 
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIn("build artifact valid", result.stdout)
+
+    def _run_build_artifact_check_on(
+        self, artifact_text: str | None, runner: str
+    ) -> tuple[subprocess.CompletedProcess, pathlib.Path]:
+        """Run the gate on one requirements artifact with the given runner."""
+        with tempfile.TemporaryDirectory() as artifact_dir:
+            artifact = pathlib.Path(artifact_dir) / "requirements.md"
+            if artifact_text is not None:
+                artifact.write_text(artifact_text, encoding="utf-8")
+            control = (
+                '[{"id": "loop", "metadata": {'
+                '"gc.root_bead_id": "root", '
+                '"gc.build.artifact_schema": "gc.build.requirements.v1", '
+                '"gc.build.artifact_path_keys": "gc.build.requirements_path"}}]'
+            )
+            root_bead = (
+                '[{"id": "root", "metadata": {'
+                f'"gc.build.requirements_path": "{artifact}"'
+                "}}]"
+            )
+            result = self._run_build_artifact_check(
+                {"loop": control, "root": root_bead}, "loop", runner=runner
+            )
+        return result, artifact
+
+    def _assert_validator_call(
+        self, argv: list[str], prefix: list[str], artifact: pathlib.Path
+    ) -> None:
+        validator = (
+            pathlib.Path(__file__).resolve().parents[1]
+            / "assets"
+            / "scripts"
+            / "validate_build_artifact.py"
+        )
+        n = len(prefix)
+        self.assertEqual(argv[:n], prefix, argv)
+        self.assertEqual(pathlib.Path(argv[n]).resolve(), validator.resolve(), argv)
+        self.assertEqual(
+            argv[n + 1 :],
+            ["--schema", "gc.build.requirements.v1", "--path", str(artifact)],
+            argv,
+        )
+
+    def test_build_artifact_check_prefers_uv_when_on_path(self) -> None:
+        result, artifact = self._run_build_artifact_check_on(
+            self._valid_requirements_artifact(), "uv"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(
+            result.stdout,
+            f"build artifact valid: schema=gc.build.requirements.v1 path={artifact}\n",
+        )
+        self.assertEqual(len(result.uv_calls), 1, result.uv_calls)
+        self._assert_validator_call(
+            result.uv_calls[0], ["run", "--quiet", "--script"], artifact
+        )
+        # python3 still runs the stdlib JSON helpers, and only those.
+        self.assertTrue(result.python_calls)
+        for argv in result.python_calls:
+            self.assertEqual(argv[0], "-c", argv)
+
+    def test_build_artifact_check_uv_branch_reports_invalid_artifact(self) -> None:
+        text = self._valid_requirements_artifact()
+        self.assertIn("## W6H\n\nW6H content.\n\n", text)
+        result, artifact = self._run_build_artifact_check_on(
+            text.replace("## W6H\n\nW6H content.\n\n", ""), "uv"
+        )
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn(
+            "build-artifact-check: schema=gc.build.requirements.v1 "
+            f"path={artifact} failed validation",
+            result.stderr,
+        )
+        self.assertRegex(result.stderr, r"(?m)^error: .*W6H")
+        self.assertEqual(len(result.uv_calls), 1, result.uv_calls)
+        self.assertEqual(result.uv_calls[0][:3], ["run", "--quiet", "--script"])
+
+    def test_build_artifact_check_falls_back_to_python3_without_uv(self) -> None:
+        result, artifact = self._run_build_artifact_check_on(
+            self._valid_requirements_artifact(), "python3"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("build artifact valid", result.stdout)
+        self.assertEqual(result.uv_calls, [])
+        validator_calls = [argv for argv in result.python_calls if argv[0] != "-c"]
+        self.assertEqual(len(validator_calls), 1, result.python_calls)
+        self._assert_validator_call(validator_calls[0], [], artifact)
+
+    def test_build_artifact_check_runs_with_uv_only(self) -> None:
+        result, artifact = self._run_build_artifact_check_on(
+            self._valid_requirements_artifact(), "uv-only"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("build artifact valid", result.stdout)
+        self.assertNotIn("command not found", result.stderr)
+        self.assertEqual(result.python_calls, [])
+        helper_calls = [
+            argv for argv in result.uv_calls if argv[:3] != ["run", "--quiet", "--script"]
+        ]
+        validator_calls = [
+            argv for argv in result.uv_calls if argv[:3] == ["run", "--quiet", "--script"]
+        ]
+        self.assertTrue(helper_calls, result.uv_calls)
+        for argv in helper_calls:
+            self.assertEqual(
+                argv[:5], ["run", "--quiet", "--no-project", "python", "-c"], argv
+            )
+        self.assertEqual(len(validator_calls), 1, result.uv_calls)
+        self._assert_validator_call(
+            validator_calls[0], ["run", "--quiet", "--script"], artifact
+        )
+
+    def test_build_artifact_check_requires_uv_or_python3(self) -> None:
+        result, _ = self._run_build_artifact_check_on(None, "none")
+
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(
+            result.stderr, "build-artifact-check: uv or python3 is required on PATH\n"
+        )
 
     def test_build_artifact_check_resolves_relative_path_from_rig_root(self) -> None:
         with tempfile.TemporaryDirectory() as td:
