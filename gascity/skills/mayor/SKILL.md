@@ -130,10 +130,19 @@ python3 <pack-root>/assets/scripts/create_beads_from_tasks.py <artifact-root>/<p
 python3 <pack-root>/assets/scripts/create_beads_from_tasks.py <artifact-root>/<plan-slug>/tasks.md
 ```
 
+When `python3` lacks PyYAML, use the uv form instead. The script declares its
+dependency inline (PEP 723), so it needs no preinstalled PyYAML:
+
+```bash
+uv run --script <pack-root>/assets/scripts/create_beads_from_tasks.py <artifact-root>/<plan-slug>/tasks.md --dry-run
+uv run --script <pack-root>/assets/scripts/create_beads_from_tasks.py <artifact-root>/<plan-slug>/tasks.md
+```
+
 If needed, pass an explicit city:
 
 ```bash
 python3 <pack-root>/assets/scripts/create_beads_from_tasks.py tasks.md --city /path/to/city
+uv run --script <pack-root>/assets/scripts/create_beads_from_tasks.py tasks.md --city /path/to/city
 ```
 
 `tasks.md` starts with:

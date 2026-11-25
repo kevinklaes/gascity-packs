@@ -983,6 +983,8 @@ Each item has only `name`, `path`, and `description`. Validate with:
 
 ```sh
 python3 <pack-root>/assets/scripts/validate_context_bundle.py context.yaml --allow-root <artifact-root>
+# or, with no preinstalled PyYAML:
+uv run --script <pack-root>/assets/scripts/validate_context_bundle.py context.yaml --allow-root <artifact-root>
 ```
 
 Gap-analysis and review reports use `schema: gc.verdict-report.v1` front matter
@@ -990,7 +992,21 @@ with `verdict: pass|fail`. Validate with:
 
 ```sh
 python3 <pack-root>/assets/scripts/validate_verdict_report.py report.md --kind review
+# or, with no preinstalled PyYAML:
+uv run --script <pack-root>/assets/scripts/validate_verdict_report.py report.md --kind review
 ```
+
+The pack's YAML-reading scripts declare their `pyyaml` dependency inline
+(PEP 723), so `uv run --script` runs them without installing PyYAML first.
+The `build-artifact-valid.sh` gate does the same: it runs the validator
+through `uv run --script` when `uv` is on the gate's `PATH`, and otherwise
+through `python3`, which then needs PyYAML. uv caches packages under
+`$HOME/.cache/uv` (or `$UV_CACHE_DIR`), and when no `python3` is on `PATH` it
+installs a managed Python under `$HOME/.local/share/uv`. Gates run with `HOME`
+set to the city root, so a city should gitignore `.cache/` (and `.local/` when
+it relies on uv-managed Python). For an offline city, warm the cache once by
+running a gate, or `uv run --script <pack-root>/assets/scripts/validate_build_artifact.py --help`
+with the same `HOME`, then set `UV_OFFLINE=1`.
 
 ## GitHub Adapter Workflows
 
