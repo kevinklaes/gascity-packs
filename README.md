@@ -220,6 +220,12 @@ reviewing, and shipping the PRs your city authors.
   skill text and it imports no other pack. Reach for `pr-pipeline` instead when
   you want the generic, standards-agnostic PR workflow.
 
+### Forge packs
+
+- [gitea](./gitea) publishes `build-basic` results as Gitea pull requests on
+  the rigs that import it, pushing over SSH and opening or reusing the PR
+  through the Gitea API. Rigs without the import keep the gascity `gh` path.
+
 ## Contributing
 
 Issues and pull requests are welcome. When a pack's surface changes, update

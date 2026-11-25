@@ -1,0 +1,2 @@
+description = 'Show the Gitea API base, owner and repo derived from origin (token-free)'
+run = '../parse-origin.sh'

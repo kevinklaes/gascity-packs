@@ -41,7 +41,7 @@ jobs:
         run: python3 validate_registry.py --require-git
 
       - name: Run Python pack tests
-        run: python3 -m pytest tests contributing-to-gascity/tests gascity/tests discord/tests github/tests oversight-rig/tests slack-full/tests slack-channel/tests pr-pipeline/tests profiler/tests runtime-herdr-core/tests/unit runtime-herdr-core/soak/tests -q
+        run: python3 -m pytest tests contributing-to-gascity/tests gascity/tests discord/tests github/tests oversight-rig/tests slack-full/tests slack-channel/tests pr-pipeline/tests profiler/tests runtime-herdr-core/tests/unit runtime-herdr-core/soak/tests gitea/tests -q
 
       - name: Lint and exercise shared role prompt composition
         run: |
@@ -58,11 +58,12 @@ jobs:
           # pinning them would waive findings most contributors never see.
           # Refute: gc lint oversight-rig  (0 findings on main, 4 on v1.4.1)
           for pack in gascity gascity/roles bmad compound-engineering gstack superpowers profiler \
-                      pr-pipeline slack-channel slack-full slack-mini runtime-herdr-core; do
+                      pr-pipeline slack-channel slack-full slack-mini runtime-herdr-core gitea; do
             "$GC_BIN" lint "$pack"
           done
           GC_TEST_BIN="$GC_BIN" python3 -m pytest oversight-rig/tests/test_order_scopes.py -q
           GC_TEST_BIN="$GC_BIN" python3 -m pytest tests/test_gc_role_prompt_integration.py tests/test_pack_composition_warnings.py -q
+          GC_TEST_BIN="$GC_BIN" python3 -m pytest gitea/tests/test_composition_live_gc.py -q
 
       # Installed, not parsed. `gc lint` above reads each pack on its own and
       # the per-pack suites read their own TOML; neither can say what gc does

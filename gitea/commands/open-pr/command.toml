@@ -1,0 +1,2 @@
+description = 'Find or create the Gitea pull request for a pushed branch'
+run = '../open-pr.sh'
