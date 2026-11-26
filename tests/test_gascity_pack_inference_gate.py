@@ -11,6 +11,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts import gascity_pack_inference_gate
 
@@ -29,6 +30,15 @@ def gate_workspace(root: Path) -> gascity_pack_inference_gate.GateWorkspace:
     workspace.city_dir.mkdir()
     workspace.rig_dir.mkdir()
     return workspace
+
+
+def _ci_runner_expr(label: str) -> str:
+    return f"${{{{ vars.CI_RUNNER || '{label}' }}}}"
+
+
+def _runs_on(relative_path: str) -> dict[str, object]:
+    data = yaml.safe_load((gascity_pack_inference_gate.REPO_ROOT / relative_path).read_text(encoding="utf-8"))
+    return {job_id: job.get("runs-on") for job_id, job in data["jobs"].items()}
 
 
 def test_write_gate_workspace_uses_city_and_rig_scope_imports(tmp_path) -> None:
@@ -408,8 +418,9 @@ def test_supported_pack_nightly_workflow_uses_manifold_shape_and_pack_matrix() -
     assert "model-smoke)" in workflow
     assert "superpowers|compound-engineering|gstack|bmad)" in workflow
     assert "max-parallel: 2" in workflow
-    assert "runs-on: blacksmith-2vcpu-ubuntu-2404" in workflow
-    assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
+    nightly_runs_on = _runs_on(".github/workflows/supported-pack-nightly.yml")
+    assert nightly_runs_on["static-contracts"] == _ci_runner_expr("blacksmith-2vcpu-ubuntu-2404")
+    assert nightly_runs_on["inference"] == _ci_runner_expr("blacksmith-32vcpu-ubuntu-2404")
     assert "GATE_TIMEOUT: ${{ github.event.inputs.timeout || matrix.gate_timeout }}" in workflow
     assert '--timeout "$GATE_TIMEOUT"' in workflow
     assert 'DOLT_VERSION: "2.6.0"' in workflow
@@ -463,7 +474,9 @@ def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
     assert "\n  schedule:" not in workflow
     assert "\n  pull_request:" not in workflow
     assert "\n  push:" not in workflow
-    assert "runs-on: blacksmith-32vcpu-ubuntu-2404" in workflow
+    assert _runs_on(".github/workflows/gascity-pack-inference.yml")["supported-pack-formulas"] == _ci_runner_expr(
+        "blacksmith-32vcpu-ubuntu-2404"
+    )
     assert 'DOLT_VERSION: "2.6.0"' in workflow
     assert "BD_VERSION" not in workflow
     assert 'go-version: "1.26.10"' in workflow
@@ -474,16 +487,26 @@ def test_dispatch_inference_workflow_is_manual_or_external_only() -> None:
     assert "ANTHROPIC_API_KEY:" not in workflow
 
 
-def test_ci_workflows_use_blacksmith_runner_labels() -> None:
+def test_ci_workflows_default_to_blacksmith_runner_labels() -> None:
     expected = {
-        ".github/workflows/ci.yml": "runs-on: blacksmith-32vcpu-ubuntu-2404",
-        ".github/workflows/codeql.yml": "runs-on: blacksmith-32vcpu-ubuntu-2404",
-        ".github/workflows/pack-release-compatibility.yml": "runs-on: blacksmith-32vcpu-ubuntu-2404",
+        ".github/workflows/ci.yml": {
+            "check": "blacksmith-32vcpu-ubuntu-2404",
+            "runtime-herdr-core": "blacksmith-2vcpu-ubuntu-2404",
+            "runtime-herdr-core-result": "blacksmith-2vcpu-ubuntu-2404",
+        },
+        ".github/workflows/codeql.yml": {"analyze": "blacksmith-32vcpu-ubuntu-2404"},
+        ".github/workflows/pack-release-compatibility.yml": {"latest-pack-releases": "blacksmith-32vcpu-ubuntu-2404"},
+        ".github/workflows/gascity-pack-inference.yml": {"supported-pack-formulas": "blacksmith-32vcpu-ubuntu-2404"},
+        ".github/workflows/supported-pack-nightly.yml": {
+            "static-contracts": "blacksmith-2vcpu-ubuntu-2404",
+            "inference": "blacksmith-32vcpu-ubuntu-2404",
+        },
     }
 
-    for relative_path, marker in expected.items():
-        workflow = (gascity_pack_inference_gate.REPO_ROOT / relative_path).read_text(encoding="utf-8")
-        assert marker in workflow
+    for relative_path, jobs in expected.items():
+        runs_on = _runs_on(relative_path)
+        for job_id, label in jobs.items():
+            assert runs_on[job_id] == _ci_runner_expr(label), f"{relative_path}:{job_id}"
 
 
 def test_readme_includes_blacksmith_sponsor_badge() -> None:
