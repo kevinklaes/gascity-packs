@@ -40,8 +40,11 @@ nonzero exit (`gc.outcome=fail`, `gc.failure_class=<error code>`,
 `gc.build.publish_status=failed`). The token file is read only by the script;
 with `open_pr` disabled it is never read.
 
-When a PR is opened or reused, also record on the workflow root:
+When a PR is opened or reused, also record on the workflow root, with `<url>`
+and `<number>` taken from the script's JSON `url` and `number`:
 
+- `gc.build.pr_url=<url>` (the key GitHub run roots carry)
+- `gc.build.pr_number=<number>` (the key GitHub run roots carry)
 - `gc.build.publish_pr_url=<url>`
 - `gc.build.publish_pr_number=<number>`
 - `gc.build.publish_forge=gitea`
