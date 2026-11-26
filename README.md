@@ -231,6 +231,32 @@ reviewing, and shipping the PRs your city authors.
 Issues and pull requests are welcome. When a pack's surface changes, update
 its README in the same PR so the docs stay current with the code.
 
+### Running tests
+
+Run the tests of the pack you changed, plus the repo-level `tests/` files your
+change touches. Do not run every suite for a one-pack change:
+
+```bash
+# A pack's own suite (gitea, gascity, discord, slack-full, pr-pipeline, ...)
+python3 -m pytest <pack>/tests -q
+
+# runtime-herdr-core: its unit tier and its strict type check, from the pack
+cd runtime-herdr-core
+python -m pytest tests/unit -q
+python -m mypy --config-file mypy.ini
+
+# A repo-level test your change touches
+python3 -m pytest tests/test_pack_composition_warnings.py -q
+```
+
+The long `pytest` line in `.github/workflows/ci.yml` is what CI runs for every
+pack on every PR. You do not need it locally for a change to one pack.
+
+Tests that drive a real `gc` binary skip unless `GC_TEST_BIN` names one:
+`GC_TEST_BIN="$(command -v gc)" python3 -m pytest tests/test_live_city_teardown.py -q`.
+They stop the `gc` and `dolt` processes gc starts for their scratch cities,
+and fail if any of them survives SIGTERM.
+
 ### Publishing registry releases
 
 Registry releases are content-addressed. Use the Make targets so the release

@@ -37,6 +37,10 @@ anchor boundary, run sandboxed verification from inside the worktree, and make a
 focused commit in the worktree. Leave the source anchor open for
 `close-source-anchor`; close only this implementation step when done.
 
+Run the tests that cover the code you changed. In a repository that holds
+several packs or projects, that is the changed one's own suite plus any
+shared tests the change touches, not the repository's whole CI test command.
+
 Write or update the task summary with these schema-required body sections,
 using the exact `##` headings below in this order:
 

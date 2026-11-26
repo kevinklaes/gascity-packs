@@ -25,6 +25,16 @@ that failed to load before doctor reached the packs produces. The canary is a
 pack whose formula declares a deprecated contract on purpose, so a test can
 require the subtraction to surface a known finding through this fixture shape,
 on this binary, in this environment.
+
+A real gc leaves city infrastructure running for a scratch city (a
+`gc doctor` starts its managed Dolt: a scope watchdog and `dolt sql-server`).
+Every city `write_city` makes is registered, and two fixtures stop what gc
+left for it (`live_city_reaper`): `reap_live_cities` after each test, for the
+cities under that test's own `tmp_path`, and `reap_live_cities_at_session_end`
+for every city still registered (module- or session-scoped ones). Both fail
+the run when a process needed SIGKILL or survived it. A module that calls
+`write_city` must import both by name next to `gc_test_bin`; `write_city`
+refuses to run otherwise.
 """
 
 from __future__ import annotations
@@ -35,10 +45,13 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import textwrap
 import tomllib
 
 import pytest
+
+import live_city_reaper
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -68,6 +81,68 @@ class Workspace:
     city_dir: Path
     rig_dir: Path
     env: dict[str, str]
+
+
+REAPER_FIXTURES = ("reap_live_cities", "reap_live_cities_at_session_end")
+
+_CITIES: set[str] = set()
+"""Every scratch city root `write_city` made and the reaper has not stopped
+yet."""
+
+
+def _stop_roots(roots: list[str], when: str) -> None:
+    """Stop what gc left for `roots`; fail on anything SIGTERM did not end."""
+    if not roots:
+        return
+    report = live_city_reaper.stop(roots)
+    for root in roots:
+        _CITIES.discard(root)
+    stubborn = report.describe(report.killed)
+    if stubborn:
+        pytest.fail(
+            f"{when}: gc or dolt processes of a scratch city ignored SIGTERM "
+            + ("and survived SIGKILL: " + "; ".join(report.describe(report.alive)) + "; " if report.alive else "")
+            + "needed SIGKILL: "
+            + "; ".join(stubborn)
+        )
+
+
+@pytest.fixture(autouse=True)
+def reap_live_cities(request: pytest.FixtureRequest):
+    """After each test, stop what gc left for the cities under the test's own
+    `tmp_path`. Never wider: pytest's basetemp also holds module-scoped
+    cities that later tests in the module still use."""
+    tmp = request.getfixturevalue("tmp_path") if "tmp_path" in request.fixturenames else None
+    yield
+    if tmp is None:
+        return
+    forms = live_city_reaper.root_forms(tmp)
+    mine = [root for root in _CITIES if any(root == f or root.startswith(f + os.sep) for f in forms)]
+    _stop_roots(mine, f"teardown of {request.node.nodeid}")
+
+
+@pytest.fixture(scope="session", autouse=True)
+def reap_live_cities_at_session_end():
+    """At session end, stop what gc left for every city still registered."""
+    yield
+    _stop_roots(sorted(_CITIES), "session end")
+
+
+def _require_reaper(depth: int = 2) -> None:
+    """The first caller outside this module must have imported both reaper
+    fixtures: pytest only runs fixtures a test module can see."""
+    frame = sys._getframe(depth)
+    while frame is not None and frame.f_globals.get("__name__") == __name__:
+        frame = frame.f_back
+    if frame is None:
+        return
+    missing = [name for name in REAPER_FIXTURES if name not in frame.f_globals]
+    if missing:
+        raise AssertionError(
+            f"{frame.f_globals.get('__name__')} calls write_city without importing "
+            f"{', '.join(missing)} from gc_live_city: a real gc would leave the "
+            "scratch city's Dolt running after the test"
+        )
 
 
 @pytest.fixture(scope="session")
@@ -253,6 +328,7 @@ def write_city(
     rig_imports: dict[str, Path] | None = None,
 ) -> Workspace:
     """A scratch city importing `imports` at city scope, `rig_imports` at rig."""
+    _require_reaper()
     city_dir = root / "city"
     rig_dir = root / "demo"
     gc_home = root / "gc-home"
@@ -347,8 +423,11 @@ def write_city(
             "GC_CITY_PATH": str(city_dir),
             "GC_CITY_ROOT": str(city_dir),
             "GC_RIG": "demo",
+            # Ties whatever gc starts for this city back to it (the reaper).
+            live_city_reaper.ROOT_ENV: str(root),
         }
     )
+    _CITIES.add(str(root))
     return Workspace(city_dir=city_dir, rig_dir=rig_dir, env=env)
 
 

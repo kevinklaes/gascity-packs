@@ -39,6 +39,8 @@ from gc_live_city import (
     discover_formulas,
     gc_output,
     gc_test_bin,  # noqa: F401 -- pytest fixture, used by name
+    reap_live_cities,  # noqa: F401 -- autouse fixture: stops what gc left per test
+    reap_live_cities_at_session_end,  # noqa: F401 -- autouse fixture: and at session end
     write_canary_pack,
     write_city,
 )

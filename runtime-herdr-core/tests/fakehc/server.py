@@ -161,6 +161,7 @@ class FakeHc:
         installed_by: Optional[str] = None,
         send_settle_s: float = 0.0,
         send_gate: Optional[str] = None,
+        pgroups_file: Optional[str] = None,
     ) -> None:
         """``next_version_file``: where ``hc server restart`` from another
         build leaves that build's version, which the core runs after a
@@ -171,7 +172,10 @@ class FakeHc:
         ``send_settle_s``: hc's send-settle rule, a terminal's sends in its
         first seconds refused ``unavailable`` with nothing typed (0: off).
         ``send_gate``: a file while which exists every send is refused so
-        (a test's on-demand refusal, released by removing it)."""
+        (a test's on-demand refusal, released by removing it).
+        ``pgroups_file``: where each program's process group is recorded
+        for the test harness (a standalone core's ``<state>/pgroups``)."""
+        self._pgroups_file = pgroups_file
         self._installed_by = installed_by
         self._send_settle_s = send_settle_s
         self._send_gate = send_gate
@@ -654,6 +658,7 @@ class FakeHc:
                     env=env,
                     keep=bool(params.get("keep")),
                     restart_delay_s=self._kept_restart_s,
+                    pgroups_file=self._pgroups_file,
                 )
             except OSError as err:
                 raise RpcFailure("spawn_failed", f"cannot start {argv[0]}: {err.strerror}") from None

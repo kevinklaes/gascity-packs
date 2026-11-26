@@ -16,7 +16,7 @@ from gc_runtime_herdr_core.herdrcore.pin import PinError, load_pin
 from . import guard
 from .fetch import unverified
 from .cases import Lane
-from .scratch import Scratch, open_scratch, write_summary
+from .scratch import Scratch, close_all, open_scratch, write_summary
 
 HERE = Path(__file__).resolve().parents[1]
 
@@ -165,6 +165,8 @@ def pytest_runtest_logreport(report: pytest.TestReport) -> None:
 
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    for line in close_all():  # a world no fixture closed (an interrupted run)
+        sys.stderr.write(f"live teardown: {line}\n")
     if not guard.live_requested(os.environ) or not _RESULTS:
         return
     lane = os.environ.get(guard.LANE_ENV, "?")

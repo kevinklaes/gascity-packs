@@ -8,7 +8,15 @@ A process belongs to the run when
   it; or
 * it is hc runtime of the run's scratch state root (its ``XDG_STATE_HOME``
   is that root, a fresh ``mktemp`` directory nothing else uses): the cores
-  and holders the run's own ops started.
+  and holders the run's own ops started; or
+* its command line names the run's scratch root (``base``, that same fresh
+  directory): what a stand-in or a session runs from there. This is the key
+  that still works where an environment cannot be read (macOS ``ps -E``
+  shows none for a platform binary).
+
+The process table is any :class:`ProcSource`: ``/proc`` on Linux, ``ps`` on
+macOS (``default_source()``). A scan reads every candidate's environment in
+one batch (:meth:`ProcSource.environs`), not one ``ps`` per process.
 
 :meth:`Ownership.signal` opens a pidfd first and then checks ownership, so a
 pid reused in between can never be signalled: the pidfd still names the
@@ -19,7 +27,7 @@ from __future__ import annotations
 
 import os
 import signal as signals
-from typing import Dict, List, Optional, Set
+from typing import Dict, Iterable, List, Mapping, Optional, Set
 
 from gc_runtime_herdr_core.herdrcore.procs import Proc, ProcError, ProcSource
 
@@ -36,17 +44,19 @@ class NotOwned(Exception):
 
 
 class Ownership:
-    def __init__(self, run_id: str, state_root: str, procs: ProcSource) -> None:
+    def __init__(self, run_id: str, state_root: str, procs: ProcSource, *, base: str = "") -> None:
         self.run_id = run_id
         self.state_root = state_root
         self.procs = procs
+        self.base = base
+        """The run's scratch root: a process whose argv names it is the run's."""
         self._started: Dict[int, str] = {}
         self.units: Set[str] = set()
         """hc units the run's cores and holders ran in (teardown checks them)."""
 
     def _proc(self, pid: int) -> Optional[Proc]:
         try:
-            return self.procs.snapshot().get(pid)
+            return self.procs.process(pid)
         except ProcError:
             return None
 
@@ -63,12 +73,18 @@ class Ownership:
         try:
             env = self.procs.environ(proc.pid) or {}
         except ProcError:
-            return False
-        if env.get("XDG_STATE_HOME") == self.state_root:
+            env = None
+        return self._judge(proc, env, runtime_only)
+
+    def _judge(self, proc: Proc, env: Optional[Mapping[str, str]], runtime_only: bool) -> bool:
+        """Whether the run owns ``proc``; ``env`` None when it could not be read."""
+        if env is not None and env.get("XDG_STATE_HOME") == self.state_root:
             return True
         if runtime_only:
             return False
-        if env.get(RUN_MARK_ENV) == self.run_id:
+        if env is not None and env.get(RUN_MARK_ENV) == self.run_id:
+            return True
+        if self.base and any(self.base in word for word in proc.argv):
             return True
         return self._started.get(proc.pid) == proc.start and proc.start != ""
 
@@ -93,28 +109,32 @@ class Ownership:
         starts its core with an allowlisted environment, and a holder restarts
         its core with its own (the core's), so neither ever carries the mark."""
         found: List[Proc] = []
-        for proc in self._scan(runtime_only=False):
-            try:
-                env = self.procs.environ(proc.pid) or {}
-            except ProcError:
-                continue
-            if env.get(RUN_MARK_ENV) != self.run_id:
+        procs = self._scan(runtime_only=False)
+        envs = self._environs(p.pid for p in procs)
+        for proc in procs:
+            env = envs.get(proc.pid)
+            if env is None or env.get(RUN_MARK_ENV) != self.run_id:
                 continue
             binary = os.path.basename(proc.argv[0]) if proc.argv else ""
             if env.get("XDG_STATE_HOME") == self.state_root or env.get(HC_RUNTIME_ENV) == "1" or binary in HC_BINARIES:
                 found.append(proc)
         return found
 
+    def _environs(self, pids: Iterable[int]) -> Dict[int, Dict[str, str]]:
+        try:
+            return self.procs.environs(pids)
+        except ProcError:
+            return {}
+
     def _scan(self, *, runtime_only: bool) -> List[Proc]:
         try:
             snapshot = self.procs.snapshot()
         except ProcError:
             return []
-        me = os.getpid()
-        return sorted(
-            (p for p in snapshot.values() if p.pid != me and not p.zombie and self._owns(p, runtime_only)),
-            key=lambda p: p.pid,
-        )
+        me, uid = os.getpid(), os.getuid()
+        candidates = [p for p in snapshot.values() if p.pid != me and not p.zombie and p.uid == uid and not p.opaque]
+        envs = self._environs(p.pid for p in candidates)
+        return sorted((p for p in candidates if self._judge(p, envs.get(p.pid), runtime_only)), key=lambda p: p.pid)
 
     def alive(self, pid: int) -> bool:
         """Whether ``pid`` runs and is not a zombie (and, when the run recorded

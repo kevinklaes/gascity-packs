@@ -12,6 +12,10 @@ worktree recorded on the source anchor, run `cd "$WORKTREE"`, and verify
 `pwd -P` equals `$WORKTREE` before any source read, source edit, test, file
 hash, `git add`, or `git commit`.
 
+Run the tests that cover the code you changed. In a repository that holds
+several packs or projects, that is the changed one's own suite plus any
+shared tests the change touches, not the repository's whole CI test command.
+
 Write or update the item summary with these schema-required body sections,
 using the exact `##` headings below in this order:
 

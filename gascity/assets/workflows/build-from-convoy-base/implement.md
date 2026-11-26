@@ -10,5 +10,9 @@ this step. Keep implementation work isolated from the launcher checkout, run
 focused tests as work progresses, and record item evidence so the inherited
 review suffix can map changes back to the approved artifacts.
 
+Run the tests that cover the code you changed. In a repository that holds
+several packs or projects, that is the changed one's own suite plus any
+shared tests the change touches, not the repository's whole CI test command.
+
 Close this step only after every drained implementation item has either passed
 with evidence or has an explicit failure artifact.

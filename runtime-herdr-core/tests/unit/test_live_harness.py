@@ -5,6 +5,10 @@ only. What decides whether they run, what they may kill, which outcome each
 holder-crash case expects, and how a run cleans up is plain logic, and it is
 checked here: against fake /proc trees, fake-hc as the hc binary, and only
 processes these tests start themselves.
+
+The tier runs on Linux and macOS. Live processes are read through the pack's
+``default_source()`` (``/proc`` on Linux, ``ps`` on macOS); a test skips on
+macOS only where macOS cannot show the fact it checks, and says why.
 """
 
 from __future__ import annotations
@@ -25,17 +29,22 @@ import releasekit
 from fakehc.cli import write_launcher
 from fakehc.procfs import add_proc
 from gc_runtime_herdr_core.herdrcore.infra_argv import is_infrastructure_argv
-from gc_runtime_herdr_core.herdrcore.procs import LinuxProcs
+from gc_runtime_herdr_core.herdrcore.procs import LinuxProcs, default_source
 from livekit import cases, guard, units
 from livekit.fetch import FetchError, fetch_pinned, unverified
 from livekit.hcrpc import HcRpc
 from livekit.owned import NotOwned, Ownership
 from livekit.pack import Pack
-from livekit.scratch import CITY_NAME, Scratch, open_scratch
+from livekit.scratch import CITY_NAME, Scratch, open_scratch, scratch_world
 
 PACK_ROOT = Path(__file__).resolve().parents[2]
 LIVE_DIR = PACK_ROOT / "tests" / "live"
 CI = {"GITHUB_ACTIONS": "true"}
+LINUX = sys.platform.startswith("linux")
+SLEEPER = "import time; time.sleep(300)"
+"""A sleep whose environment ``ps -E`` can read on macOS (it shows none for
+a platform binary such as ``/bin/sleep``), so ownership by the run's mark or
+state root can be judged there too."""
 
 
 # --- refusal -----------------------------------------------------------------------
@@ -303,13 +312,13 @@ def started() -> Iterator[List["subprocess.Popen[bytes]"]]:
 
 
 def _sleep(env: Dict[str, str]) -> "subprocess.Popen[bytes]":
-    return subprocess.Popen(["sleep", "60"], env=dict(env, PATH=os.environ.get("PATH", "/usr/bin:/bin")))
+    return subprocess.Popen([sys.executable, "-c", SLEEPER], env=dict(env, PATH=os.environ.get("PATH", "/usr/bin:/bin")))
 
 
 def test_signal_refuses_a_process_the_run_does_not_own(started: List["subprocess.Popen[bytes]"]) -> None:
     stranger = _sleep({})
     started.append(stranger)
-    own = Ownership("run-x", "/nonexistent", LinuxProcs())
+    own = Ownership("run-x", "/nonexistent", default_source())
     with pytest.raises(NotOwned):
         own.signal(stranger.pid, signal.SIGKILL)
     time.sleep(0.1)
@@ -319,7 +328,7 @@ def test_signal_refuses_a_process_the_run_does_not_own(started: List["subprocess
 def test_signal_kills_a_marked_process(started: List["subprocess.Popen[bytes]"]) -> None:
     marked = _sleep({"GC_HC_LIVE_RUN": "run-y"})
     started.append(marked)
-    own = Ownership("run-y", "/nonexistent", LinuxProcs())
+    own = Ownership("run-y", "/nonexistent", default_source())
     _wait_for(lambda: own.owns(marked.pid))  # the environ is readable once exec is done
     own.signal(marked.pid, signal.SIGKILL)
     assert marked.wait(timeout=10) == -signal.SIGKILL
@@ -329,7 +338,7 @@ def test_signal_of_a_gone_pid_is_not_ownership(started: List["subprocess.Popen[b
     gone = _sleep({"GC_HC_LIVE_RUN": "run-z"})
     gone.kill()
     gone.wait(timeout=10)
-    own = Ownership("run-z", "/nonexistent", LinuxProcs())
+    own = Ownership("run-z", "/nonexistent", default_source())
     with pytest.raises(NotOwned):
         own.signal(gone.pid, signal.SIGKILL)
 
@@ -438,9 +447,8 @@ def fake_bin(short_tmp: Path) -> Path:
 
 @pytest.fixture
 def scratch(fake_bin: Path) -> Iterator[Scratch]:
-    made = open_scratch(guard.clearance(CI), "plain", str(fake_bin), python=sys.executable)
-    yield made
-    made.close()
+    with scratch_world(guard.clearance(CI), "plain", str(fake_bin), python=sys.executable) as made:
+        yield made
 
 
 def test_a_scratch_root_is_private_and_short(scratch: Scratch) -> None:
@@ -486,15 +494,15 @@ def test_the_systemd_lane_leaves_spawn_files_at_their_production_location(fake_b
 
 
 def test_teardown_stops_every_core_and_removes_the_root(fake_bin: Path) -> None:
-    made = open_scratch(guard.clearance(CI), "plain", str(fake_bin), python=sys.executable)
-    pack = Pack(made)
-    answer = pack.start("live-a", f"exec sleep 300")
-    assert answer.code == 0, answer.stderr
-    rpc = HcRpc(made.paths().socket)
-    status = rpc.status()
-    assert status.holders and made.ownership.owns(status.pid, runtime_only=True)
-    report = made.close()
-    assert report == [], report
+    with scratch_world(guard.clearance(CI), "plain", str(fake_bin), python=sys.executable) as made:
+        pack = Pack(made)
+        answer = pack.start("live-a", f"exec sleep 300")
+        assert answer.code == 0, answer.stderr
+        rpc = HcRpc(made.paths().socket)
+        status = rpc.status()
+        assert status.holders and made.ownership.owns(status.pid, runtime_only=True)
+        report = made.close()
+        assert report == [], report
     assert not os.path.exists(made.base)
     with pytest.raises(OSError):
         rpc.status()
@@ -502,13 +510,16 @@ def test_teardown_stops_every_core_and_removes_the_root(fake_bin: Path) -> None:
 
 def test_teardown_reports_and_kills_a_runtime_process_that_outlives_the_stop(fake_bin: Path) -> None:
     made = open_scratch(guard.clearance(CI), "plain", str(fake_bin), python=sys.executable)
-    straggler = subprocess.Popen(["sleep", "300"], env={"PATH": "/usr/bin:/bin", "XDG_STATE_HOME": made.state_root, "HC_RUNTIME": "1"})
+    straggler = subprocess.Popen(
+        [sys.executable, "-c", SLEEPER], env={"PATH": "/usr/bin:/bin", "XDG_STATE_HOME": made.state_root, "HC_RUNTIME": "1"}
+    )
     try:
         _wait_for(lambda: made.ownership.owns(straggler.pid, runtime_only=True))
         report = made.close(grace_s=0.5)
         assert any(str(straggler.pid) in line for line in report), report
-        assert straggler.wait(timeout=10) == -signal.SIGKILL
+        assert straggler.wait(timeout=10) in (-signal.SIGTERM, -signal.SIGKILL)
     finally:
+        made.close()
         if straggler.poll() is None:
             straggler.kill()
             straggler.wait()
@@ -516,12 +527,13 @@ def test_teardown_reports_and_kills_a_runtime_process_that_outlives_the_stop(fak
 
 def test_teardown_kills_the_runs_marked_survivors_without_complaint(fake_bin: Path) -> None:
     made = open_scratch(guard.clearance(CI), "plain", str(fake_bin), python=sys.executable)
-    survivor = subprocess.Popen(["sleep", "300"], env={"PATH": "/usr/bin:/bin", "GC_HC_LIVE_RUN": made.run_id})
+    survivor = subprocess.Popen([sys.executable, "-c", SLEEPER], env={"PATH": "/usr/bin:/bin", "GC_HC_LIVE_RUN": made.run_id})
     try:
         _wait_for(lambda: made.ownership.owns(survivor.pid))
         assert made.close() == []
-        assert survivor.wait(timeout=10) == -signal.SIGKILL
+        assert survivor.wait(timeout=10) in (-signal.SIGTERM, -signal.SIGKILL)
     finally:
+        made.close()
         if survivor.poll() is None:
             survivor.kill()
             survivor.wait()
@@ -575,7 +587,7 @@ def test_the_agent_spawns_detached_infrastructure_with_gcs_argv(scratch: Scratch
     agent = _agent(scratch, "a1", GC_HC_LIVE_SPAWN="infra,orphan")
     try:
         report = scratch.agent_report("a1", timeout_s=20, want=("infra", "orphan"))
-        procs = LinuxProcs().snapshot()
+        procs = default_source().snapshot()
         watchdog, dolt, proxy = (report.infra[role] for role in ("watchdog", "dolt", "proxy"))
         assert is_infrastructure_argv(procs[watchdog].argv), procs[watchdog].argv
         assert is_infrastructure_argv(procs[proxy].argv), procs[proxy].argv
@@ -591,6 +603,7 @@ def test_the_agent_spawns_detached_infrastructure_with_gcs_argv(scratch: Scratch
     assert scratch.close() == []
 
 
+@pytest.mark.skipif(not LINUX, reason="macOS ps -E shows no environment for a platform binary such as /bin/sleep (the witness)")
 def test_the_agents_witness_drops_hc_scope_and_keeps_the_run_mark(scratch: Scratch) -> None:
     agent = _agent(scratch, "a5", GC_HC_LIVE_SPAWN="witness", HC_SCOPE="12-abcdef")
     try:
@@ -599,7 +612,7 @@ def test_the_agents_witness_drops_hc_scope_and_keeps_the_run_mark(scratch: Scrat
         env = scratch.ownership.procs.environ(report.witness) or {}
         assert "HC_SCOPE" not in env and env.get("GC_HC_LIVE_RUN") == scratch.run_id
         assert os.getsid(report.witness) == report.witness
-        procs = LinuxProcs().snapshot()
+        procs = default_source().snapshot()
         ancestor = procs[report.witness].ppid
         while ancestor > 1 and ancestor in procs:
             assert ancestor != agent.pid, "the witness is the agent's descendant: hc's sweep would take it"
@@ -719,13 +732,13 @@ def test_the_live_report_is_json(scratch: Scratch) -> None:
 
 
 def test_teardown_removes_the_root_even_when_a_step_fails(fake_bin: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    made = open_scratch(guard.clearance(CI), "plain", str(fake_bin), python=sys.executable)
+    with scratch_world(guard.clearance(CI), "plain", str(fake_bin), python=sys.executable) as made:
 
-    def broken(problems: List[str]) -> None:
-        raise RuntimeError("boom")
+        def broken(problems: List[str]) -> None:
+            raise RuntimeError("boom")
 
-    monkeypatch.setattr(made, "_stop_cores", broken)
-    report = made.close()
+        monkeypatch.setattr(made, "_stop_cores", broken)
+        report = made.close()
     assert any("boom" in line for line in report), report
     assert not os.path.exists(made.base)
 

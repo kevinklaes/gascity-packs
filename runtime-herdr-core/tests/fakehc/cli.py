@@ -49,12 +49,18 @@ from typing import Any, Dict, List, Optional, Tuple
 if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from fakehc.groups import PGROUPS_FILE, record_group, record_self  # noqa: E402
 from fakehc.rawclient import raw_call  # noqa: E402
 
 START_WAIT_S = 15.0
 """How long ``server start`` waits for the new core (hc ``client.rs`` START_WAIT)."""
 
 VIOLATIONS_LOG = "schema-violations.log"
+
+SERVE_EXIT_BOUND_S = 1.5
+"""How long ``serve`` may take to close after SIGTERM or SIGINT before it
+exits regardless: a signalled core is gone within 2 s. Programs its close
+did not finish reaping are in ``<state>/pgroups`` for the harness."""
 
 
 class Usage(Exception):
@@ -258,7 +264,7 @@ def spawn_core(env: Dict[str, str], *, starter_pid: int) -> None:
         child_env = _starter(env)
         child_env["HC_RUNTIME"] = "1"
     with open(os.path.join(paths["state"], "core.log"), "ab") as log:
-        subprocess.Popen(
+        core = subprocess.Popen(
             argv,
             env=child_env,
             cwd="/",
@@ -267,6 +273,7 @@ def spawn_core(env: Dict[str, str], *, starter_pid: int) -> None:
             stderr=log,
             start_new_session=True,
         )
+    record_group(os.path.join(paths["state"], PGROUPS_FILE), core.pid)
 
 
 def hold(env: Dict[str, str]) -> int:
@@ -275,6 +282,8 @@ def hold(env: Dict[str, str]) -> int:
     and the holder as its starter."""
     paths = _paths(env)
     env = {k: v for k, v in env.items() if k != "_HC_RESPONSIBLE_PID"}  # hc drops its re-exec mark in-process
+    os.makedirs(paths["state"], mode=0o700, exist_ok=True)
+    record_self(os.path.join(paths["state"], PGROUPS_FILE))
     if not _answers(paths["socket"]):
         spawn_core(env, starter_pid=os.getpid())
     stop = threading.Event()
@@ -338,10 +347,22 @@ def serve(env: Dict[str, str], version: str = "0.1.19", send_gate: str = "") -> 
         version=version,
         next_version_file=os.path.join(paths["state"], NEXT_VERSION_FILE),
         send_gate=send_gate or None,
+        pgroups_file=os.path.join(paths["state"], PGROUPS_FILE),
     )
     done = threading.Event()
-    signal.signal(signal.SIGTERM, lambda signum, frame: done.set())
-    signal.signal(signal.SIGINT, lambda signum, frame: done.set())
+    bound: List[threading.Timer] = []
+
+    def on_signal(signum: int, frame: object) -> None:
+        # A signalled core exits within 2 s even if closing hangs.
+        if not bound:
+            timer = threading.Timer(SERVE_EXIT_BOUND_S, os._exit, (0,))
+            timer.daemon = True
+            timer.start()
+            bound.append(timer)
+        done.set()
+
+    signal.signal(signal.SIGTERM, on_signal)
+    signal.signal(signal.SIGINT, on_signal)
     fake.start()
     try:
         while not done.is_set() and not fake.stopped.is_set():
@@ -350,6 +371,8 @@ def serve(env: Dict[str, str], version: str = "0.1.19", send_gate: str = "") -> 
     finally:
         fake.close()
         _flush_violations(fake, paths["state"])
+        for timer in bound:
+            timer.cancel()
     return 0
 
 
@@ -399,6 +422,8 @@ def attach(env: Dict[str, str], terminal: str) -> int:
     if "error" in reply:
         print(json.dumps(reply["error"]), file=sys.stderr)
         return 1
+    if os.path.isdir(paths["state"]):
+        record_self(os.path.join(paths["state"], PGROUPS_FILE))
     stop = threading.Event()
     signal.signal(signal.SIGTERM, lambda signum, frame: stop.set())
     while not stop.is_set():
@@ -407,6 +432,9 @@ def attach(env: Dict[str, str], terminal: str) -> int:
 
 
 def main(argv: List[str], env: Dict[str, str]) -> int:
+    # A parent that ignored SIGTERM must not make this process immune to it;
+    # serve, hold and attach install their own handlers.
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     try:
         if argv[:2] == ["server", "start"]:
             return server_start(env)
