@@ -11,6 +11,10 @@ and `cd "$WORKTREE"` before source reads, edits, tests, hashes, or commits.
 reading beads with `gc bd show --json`, handle both an object and a one-element
 list before reading metadata.
 
+Run the tests that cover the code you changed. In a repository that holds
+several packs or projects, that is the changed one's own suite plus any
+shared tests the change touches, not the repository's whole CI test command.
+
 Write the per-item implementation summary as a `gc.build.implementation-summary.v1`
 artifact and record its absolute path on the workflow root bead as
 `gc.implementation.summary_path` before closing.
