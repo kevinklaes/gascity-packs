@@ -60,10 +60,6 @@ class Ownership:
         except ProcError:
             return None
 
-    def started(self) -> List[int]:
-        """The pids the run recorded with :meth:`record`."""
-        return sorted(self._started)
-
     def record(self, pid: int) -> None:
         """Remember a process the run started itself."""
         proc = self._proc(pid)

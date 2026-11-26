@@ -473,7 +473,6 @@ class Scratch:
             self._systemctl("stop", "--", unit)
 
 
-
 _OPEN: Dict[int, Scratch] = {}
 """Every world :func:`open_scratch` made that is not closed yet."""
 

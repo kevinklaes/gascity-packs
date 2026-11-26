@@ -85,9 +85,9 @@ class Workspace:
 
 REAPER_FIXTURES = ("reap_live_cities", "reap_live_cities_at_session_end")
 
-_CITIES: dict[str, dict[str, str]] = {}
+_CITIES: set[str] = set()
 """Every scratch city root `write_city` made and the reaper has not stopped
-yet, with that city's environment."""
+yet."""
 
 
 def _stop_roots(roots: list[str], when: str) -> None:
@@ -96,7 +96,7 @@ def _stop_roots(roots: list[str], when: str) -> None:
         return
     report = live_city_reaper.stop(roots)
     for root in roots:
-        _CITIES.pop(root, None)
+        _CITIES.discard(root)
     stubborn = report.describe(report.killed)
     if stubborn:
         pytest.fail(
@@ -427,7 +427,7 @@ def write_city(
             live_city_reaper.ROOT_ENV: str(root),
         }
     )
-    _CITIES[str(root)] = dict(env)
+    _CITIES.add(str(root))
     return Workspace(city_dir=city_dir, rig_dir=rig_dir, env=env)
 
 

@@ -20,12 +20,9 @@ How a process is tied to a root (any one is enough; only this user's `gc`,
 - working directory under the root (`/proc/<pid>/cwd` on Linux, `lsof` for
   the candidates on macOS).
 
-Which gc command stops a scratch city's managed Dolt (checked on gc 1.5.1,
-no supervisor running): `gc stop` with the city's environment stops both the
-watchdog and `dolt sql-server`, but takes about 15 s per city; `gc dolt stop`
-does not exist there (`unknown command "dolt"`). A plain SIGTERM ends both at
-once, so `stop` signals by default (watchdogs first, so none restarts its
-store), and runs `gc stop` first only when asked (`gc_bin`).
+SIGTERM ends a scratch city's watchdog and `dolt sql-server` at once
+(watchdogs first, so none restarts its store); `gc stop` also works but
+takes ~15 s per city.
 
 Standard library only; it imports nothing from any pack.
 """
@@ -38,7 +35,7 @@ import signal
 import subprocess
 import sys
 import time
-from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Set
+from typing import Dict, Iterable, List, Optional, Sequence, Set
 
 ROOT_ENV = "GC_PACKS_TEST_ROOT"
 ENV_KEYS = (ROOT_ENV, "GC_CITY", "GC_CITY_PATH", "GC_CITY_ROOT", "GC_HOME", "HOME")
@@ -71,13 +68,11 @@ class Proc:
 class StopReport:
     found: List[Proc] = field(default_factory=list)
     termed: List[int] = field(default_factory=list)
-    """Ended by SIGTERM (or by `gc stop`)."""
+    """Ended by SIGTERM."""
     killed: List[int] = field(default_factory=list)
     """Needed SIGKILL."""
     alive: List[int] = field(default_factory=list)
     """Still alive after SIGKILL."""
-    gc_stop: str = ""
-    """What `gc stop` said, when it ran."""
 
     def describe(self, pids: Iterable[int]) -> List[str]:
         by_pid = {p.pid: p for p in self.found}
@@ -251,41 +246,15 @@ def _signal(pid: int, sig: int) -> None:
         pass
 
 
-def stop(
-    roots: Sequence[os.PathLike[str] | str],
-    *,
-    grace_s: float = 5.0,
-    gc_bin: Optional[os.PathLike[str] | str] = None,
-    env_by_root: Optional[Mapping[str, Mapping[str, str]]] = None,
-    gc_stop_timeout_s: float = 30.0,
-) -> StopReport:
-    """End every process tied to `roots`: with `gc_bin`, `gc stop` in each
-    city first (bounded); then SIGTERM (watchdogs first), up to `grace_s`,
-    then SIGKILL for what is left. Only processes `find` still ties to a root
-    are ever signalled."""
+def stop(roots: Sequence[os.PathLike[str] | str], *, grace_s: float = 5.0) -> StopReport:
+    """End every process tied to `roots`: SIGTERM (watchdogs first), up to
+    `grace_s`, then SIGKILL for what is left. Only processes `find` still ties
+    to a root are ever signalled."""
     report = StopReport()
     roots = [os.fspath(root) for root in roots]
     report.found = find(roots)
     if not report.found:
         return report
-    if gc_bin is not None:
-        outputs = []
-        for root, env in (env_by_root or {}).items():
-            city = env.get("GC_CITY", root)
-            try:
-                done = subprocess.run(
-                    [os.fspath(gc_bin), "stop"],
-                    cwd=city,
-                    env=dict(env),
-                    capture_output=True,
-                    text=True,
-                    timeout=gc_stop_timeout_s,
-                    check=False,
-                )
-                outputs.append(f"{root}: exit {done.returncode}")
-            except (OSError, subprocess.TimeoutExpired) as err:
-                outputs.append(f"{root}: {err}")
-        report.gc_stop = "; ".join(outputs)
     pids = [p.pid for p in report.found]
     live = _alive(pids, roots)
     watchdogs = [p.pid for p in report.found if p.watchdog and p.pid in live]
