@@ -8,13 +8,27 @@ directory, the agents' working directory and the infrastructure stand-ins.
 Teardown stops every core it finds under ``R`` (``R/herdr-core/*/core.lock``:
 the city key, ``unscoped`` and gc's conformance city keys each start one),
 then requires that no hc runtime process of ``R`` and no hc unit those
-processes ran in is left, kills the run's own marked survivors (the
-infrastructure stand-ins the suites expect to outlive a crash), and removes
-the directory. Every kill goes through :class:`~.owned.Ownership`.
+processes ran in is left, ends the run's own survivors (the infrastructure
+stand-ins the suites expect to outlive a crash), and removes the directory
+last.
+
+Ending survivors escalates and works the same on Linux and macOS: every
+process group the run recorded (``pgroups`` files under the root, see
+:mod:`.pgroups`) gets ``SIGTERM``, a short grace (:attr:`Scratch.term_grace_s`,
+at most 5 s), then ``SIGKILL``; then whatever :class:`~.owned.Ownership` or
+the portable scan still finds gets the same, one process at a time, through
+:meth:`~.owned.Ownership.signal`. A process that needed ``SIGKILL`` is a
+teardown note, not a problem.
+
+Every world :func:`open_scratch` makes is registered until it is closed, so
+a test that forgets ``close()`` (or dies before it) is closed by a safety net
+(:func:`open_worlds`, :func:`close_all`); :func:`scratch_world` opens one
+that always closes.
 """
 
 from __future__ import annotations
 
+import atexit
 import glob
 import json
 import os
@@ -27,14 +41,16 @@ import sys
 import tempfile
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Set
+from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Set
 
 from gc_runtime_herdr_core.hc.paths import HcPaths, resolve_paths
-from gc_runtime_herdr_core.herdrcore.procs import LinuxProcs
+from gc_runtime_herdr_core.herdrcore.procs import default_source
 from gc_runtime_herdr_core.rpp.jsonval import JsonObject, loads
 
+from . import pgroups
 from .cases import Lane
 from .guard import Clearance
 from .owned import RUN_MARK_ENV, NotOwned, Ownership
@@ -104,6 +120,8 @@ class Scratch:
     notes: Dict[str, object] = field(default_factory=dict)
     teardown_notes: List[str] = field(default_factory=list)
     closed: bool = False
+    term_grace_s: float = pgroups.DEFAULT_TERM_GRACE_S
+    """How long a survivor gets after ``SIGTERM`` before ``SIGKILL`` (capped at 5 s)."""
 
     # --- layout -----------------------------------------------------------------------
 
@@ -133,6 +151,11 @@ class Scratch:
     @property
     def standin_dir(self) -> str:
         return os.path.join(self.base, "standin")
+
+    @property
+    def pgroups_path(self) -> str:
+        """The registry the run's agents append their detached groups to."""
+        return os.path.join(self.base, pgroups.PGROUPS_FILE)
 
     @property
     def runtime_dir(self) -> str:
@@ -207,6 +230,7 @@ class Scratch:
             "GC_HC_LIVE_AGENT": name,
             "GC_HC_LIVE_STANDINS": self.standin_dir,
             "GC_HC_LIVE_PYTHON": self.python,
+            pgroups.PGROUPS_ENV: self.pgroups_path,
             "GC_INSTANCE_TOKEN": f"{self.run_id}-{name}-{uuid.uuid4().hex[:8]}",
             "XDG_STATE_HOME": os.path.join(self.base, "agent-state"),
             "XDG_CONFIG_HOME": os.path.join(self.base, "agent-config"),
@@ -358,14 +382,17 @@ class Scratch:
             return []
         self.closed = True
         problems: List[str] = []
-        for step in (self._stop_cores, lambda p: self._reap(p, grace_s), self._stop_units):
-            try:
-                step(problems)
-            except Exception as err:  # noqa: BLE001 - teardown must reach the removal
-                problems.append(f"teardown step failed: {err!r}")
-        if self.lane == "systemd" and os.path.isdir(self.spawn_root):
-            shutil.rmtree(self.spawn_root)  # the scratch city's own spawn directory
-        _remove(self.base)
+        try:
+            for step in (self._stop_cores, lambda p: self._reap(p, grace_s), self._stop_units):
+                try:
+                    step(problems)
+                except Exception as err:  # noqa: BLE001 - teardown must reach the removal
+                    problems.append(f"teardown step failed: {err!r}")
+            if self.lane == "systemd" and os.path.isdir(self.spawn_root):
+                shutil.rmtree(self.spawn_root)  # the scratch city's own spawn directory
+        finally:
+            _OPEN.pop(id(self), None)
+            _remove(self.base)
         return problems
 
     def _stop_cores(self, problems: List[str]) -> None:
@@ -398,11 +425,41 @@ class Scratch:
         end = time.monotonic() + grace_s
         while self.ownership.runtime() and time.monotonic() < end:
             time.sleep(0.2)
-        for proc in self.ownership.marked():
-            self._kill(proc.pid)
         for proc in self.ownership.runtime():
             problems.append(f"hc runtime of the scratch root outlived teardown: pid {proc.pid} {' '.join(proc.argv)[:200]}")
-            self._kill(proc.pid)
+        grace = min(max(self.term_grace_s, 0.0), pgroups.MAX_TERM_GRACE_S)
+        report = pgroups.kill_groups(pgroups.read_groups([self.base]), term_grace_s=grace)
+        self.teardown_notes.extend(report.skipped)
+        for pgid in report.killed:
+            self.teardown_notes.append(f"needed SIGKILL after SIGTERM: {report.describe(pgid)}")
+        for pgid in report.alive:
+            problems.append(f"a recorded process group survived SIGKILL: {report.describe(pgid)}")
+        leftover = {p.pid for p in self.ownership.marked()} | {p.pid for p in self.ownership.runtime()}
+        leftover |= {row.pid for row in pgroups.scan(self.base)}
+        self._terminate(sorted(leftover), grace, problems)
+
+    def _terminate(self, pids: Sequence[int], grace_s: float, problems: List[str]) -> None:
+        """``SIGTERM`` each owned pid, up to ``grace_s`` for it to go, then ``SIGKILL``."""
+        sent = [pid for pid in pids if self._send(pid, signal.SIGTERM)]
+        end = time.monotonic() + grace_s
+        while time.monotonic() < end and any(self.ownership.alive(pid) for pid in sent):
+            time.sleep(0.1)
+        for pid in sent:
+            if self.ownership.alive(pid) and self._send(pid, signal.SIGKILL):
+                self.teardown_notes.append(f"needed SIGKILL after SIGTERM: pid {pid}")
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline and any(self.ownership.alive(pid) for pid in sent):
+            time.sleep(0.1)
+        for pid in sent:
+            if self.ownership.alive(pid):
+                problems.append(f"pid {pid} of the run survived SIGKILL")
+
+    def _send(self, pid: int, sig: int) -> bool:
+        try:
+            self.ownership.signal(pid, sig)
+        except NotOwned:
+            return False
+        return True
 
     def _stop_units(self, problems: List[str]) -> None:
         if self.lane != "systemd":
@@ -415,11 +472,41 @@ class Scratch:
         for unit in sorted(self.created_units):
             self._systemctl("stop", "--", unit)
 
-    def _kill(self, pid: int) -> None:
+
+
+_OPEN: Dict[int, Scratch] = {}
+"""Every world :func:`open_scratch` made that is not closed yet."""
+
+
+def open_worlds() -> List[Scratch]:
+    """The scratch worlds opened and not closed yet, oldest first."""
+    return list(_OPEN.values())
+
+
+def close_all(*, grace_s: float = 5.0) -> List[str]:
+    """Close every open world (a safety net); what went wrong, per world."""
+    problems: List[str] = []
+    for made in open_worlds():
         try:
-            self.ownership.signal(pid, signal.SIGKILL)
-        except NotOwned:
+            problems.extend(f"{made.base}: {line}" for line in made.close(grace_s=grace_s))
+        except Exception as err:  # noqa: BLE001 - a net closes every world it can
+            problems.append(f"{made.base}: close failed: {err!r}")
+    return problems
+
+
+def _kill_open_groups() -> None:
+    """At interpreter exit: end the groups every still-open world recorded
+    and remove its root. Cheap insurance for a run that died before its
+    fixtures' teardown; never runs hc."""
+    for made in open_worlds():
+        try:
+            pgroups.kill_groups(pgroups.read_groups([made.base]), term_grace_s=1.0)
+        except Exception:  # noqa: BLE001 - exit must go on
             pass
+        shutil.rmtree(made.base, ignore_errors=True)
+
+
+atexit.register(_kill_open_groups)
 
 
 def open_scratch(clearance: Clearance, lane: Lane, hc_bin: str, *, python: Optional[str] = None) -> Scratch:
@@ -435,8 +522,9 @@ def open_scratch(clearance: Clearance, lane: Lane, hc_bin: str, *, python: Optio
         python=python or sys.executable,
         run_id=run_id,
         base=base,
-        ownership=Ownership(run_id, os.path.join(base, "state"), LinuxProcs()),
+        ownership=Ownership(run_id, os.path.join(base, "state"), default_source(), base=base),
     )
+    _OPEN[id(scratch)] = scratch
     for path in (scratch.state_root, scratch.work, scratch.city_path, scratch.standin_dir):
         _private_dir(path)
     if lane == "plain":
@@ -447,6 +535,26 @@ def open_scratch(clearance: Clearance, lane: Lane, hc_bin: str, *, python: Optio
         shutil.copyfile(str(STANDIN), target)
         os.chmod(target, 0o600)
     return scratch
+
+
+@contextmanager
+def scratch_world(
+    clearance: Clearance,
+    lane: Lane,
+    hc_bin: str,
+    *,
+    python: Optional[str] = None,
+    problems: Optional[List[str]] = None,
+) -> Iterator[Scratch]:
+    """:func:`open_scratch` that always closes, even when the body raises;
+    the close's problems go to ``problems`` when given."""
+    made = open_scratch(clearance, lane, hc_bin, python=python)
+    try:
+        yield made
+    finally:
+        found = made.close()
+        if problems is not None:
+            problems.extend(found)
 
 
 def write_summary(lines: Mapping[str, object], path: Optional[str]) -> None:

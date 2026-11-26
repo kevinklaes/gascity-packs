@@ -8,6 +8,13 @@ repository root (the shared pytest step).
 No test in this tier builds, installs or runs a real herdr-core binary: every
 hc conversation is with the in-process fake-hc, whose every result and every
 client request is checked against the vendored hc schema.
+
+Nothing a test starts may outlive the run, on Linux or macOS, whether the
+test passes, fails or is interrupted: ``short_tmp`` ends the process groups
+recorded under its root before removing it, ``teardown_cores`` finds a test's
+standalone cores with a portable scan (``/proc`` on Linux, ``ps`` on macOS),
+and two autouse safety nets close any live-harness scratch world a test left
+open, the session one also at Ctrl-C.
 """
 
 from __future__ import annotations
@@ -16,8 +23,9 @@ import os
 import shutil
 import sys
 import tempfile
+import warnings
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Iterator, List, Optional
+from typing import TYPE_CHECKING, Callable, Iterator, List, Optional, Set
 
 import pytest
 
@@ -30,20 +38,69 @@ from fakehc import FakeHc  # noqa: E402
 from gc_runtime_herdr_core.hc.client import BackendFault, CallTimeouts, CoreEndpoint, HcClient  # noqa: E402
 from gc_runtime_herdr_core.hc.version import Version, VersionPolicy  # noqa: E402
 from gc_runtime_herdr_core.rpp.cancel import CancelToken, Deadline  # noqa: E402
+from livekit import pgroups  # noqa: E402
 
 TEST_POLICY = VersionPolicy(min_version=Version.parse("0.1.19"), tested=(Version.parse("0.1.19"),))
 
 ClientFactory = Callable[..., HcClient]
 
 
+_SESSION_ROOTS: Set[str] = set()
+"""Short temp roots made this session and not removed yet (the session net's)."""
+
+
+def _end_root(path: str) -> None:
+    """End every process group recorded under ``path``, then remove it."""
+    try:
+        pgroups.kill_groups(pgroups.read_groups([path]), term_grace_s=1.0)
+    finally:
+        shutil.rmtree(path, ignore_errors=True)
+        _SESSION_ROOTS.discard(path)
+
+
+@pytest.fixture(autouse=True)
+def _close_forgotten_scratch_worlds(request: pytest.FixtureRequest) -> Iterator[None]:
+    """After each test, close any live-harness scratch world it opened and
+    left open (a failing body, a forgotten ``close()``), and say so."""
+    from livekit.scratch import open_worlds
+
+    before = {id(world) for world in open_worlds()}
+    yield
+    for world in open_worlds():
+        if id(world) in before:
+            continue
+        problems = world.close(grace_s=5.0)
+        warnings.warn(
+            pytest.PytestWarning(
+                f"{request.node.nodeid} left scratch world {world.base} open; closed it"
+                + (": " + "; ".join(problems) if problems else "")
+            ),
+            stacklevel=1,
+        )
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _end_everything_at_session_end() -> Iterator[None]:
+    """At session end (pytest runs this on Ctrl-C too): close every scratch
+    world still open, end the groups recorded under every short root still
+    on disk, and remove those roots."""
+    yield
+    from livekit.scratch import close_all
+
+    close_all()
+    for root in sorted(_SESSION_ROOTS):
+        _end_root(root)
+
+
 @pytest.fixture
 def short_tmp() -> Iterator[Path]:
     """A short private directory: a Unix socket path must fit in sun_path."""
     path = os.path.realpath(tempfile.mkdtemp(prefix="hcrt-", dir="/tmp"))  # /tmp is a symlink on macOS
+    _SESSION_ROOTS.add(path)
     try:
         yield Path(path)
     finally:
-        shutil.rmtree(path, ignore_errors=True)
+        _end_root(path)
 
 
 @pytest.fixture
@@ -113,34 +170,51 @@ def city(short_tmp: Path, home_dir: Path) -> Iterator["City"]:
 
 
 def _processes_for(root: Path, marker: str) -> List[int]:
-    """Pids of this user's processes whose argv holds ``marker`` and whose
-    environment points at state root ``root`` (``GC_EXEC_STATE_DIR`` or ``XDG_STATE_HOME``)."""
-    found: List[int] = []
-    for entry in os.listdir("/proc"):
-        if not entry.isdigit():
-            continue
+    """Pids of this user's live processes whose argv holds ``marker`` and
+    that belong to state root ``root``: their environment points at it
+    (``GC_EXEC_STATE_DIR`` or ``XDG_STATE_HOME``), or they are in a process
+    group recorded under it. Portable: ``/proc`` on Linux, ``ps`` on macOS."""
+    from gc_runtime_herdr_core.herdrcore.procs import ProcError, default_source
+
+    procs = default_source()
+    try:
+        snapshot = procs.snapshot()
+    except ProcError:
+        return []
+    me, uid = os.getpid(), os.getuid()
+    candidates = [
+        p.pid
+        for p in snapshot.values()
+        if p.pid != me and p.uid == uid and not p.zombie and not p.opaque and any(marker in word for word in p.argv)
+    ]
+    if not candidates:
+        return []
+    envs = procs.environs(candidates)
+    wanted = str(root)
+    found = {
+        pid
+        for pid in candidates
+        if envs.get(pid, {}).get("GC_EXEC_STATE_DIR") == wanted or envs.get(pid, {}).get("XDG_STATE_HOME") == wanted
+    }
+    groups = pgroups.read_groups([wanted]) if os.path.isdir(wanted) else []
+    if groups:
         try:
-            argv = Path(f"/proc/{entry}/cmdline").read_bytes()
-            if marker.encode() not in argv:
-                continue
-            env = Path(f"/proc/{entry}/environ").read_bytes().split(b"\0")
-        except OSError:
-            continue
-        wanted = {f"GC_EXEC_STATE_DIR={root}".encode(), f"XDG_STATE_HOME={root}".encode()}
-        if wanted & set(env):
-            found.append(int(entry))
-    return found
+            rows = pgroups.table()
+        except pgroups.TableError:
+            rows = {}
+        owned, _ = pgroups.owned_groups(groups, rows)
+        found.update(pid for pid in candidates if pid in rows and rows[pid].pgid in owned)
+    return sorted(found)
 
 
 def teardown_cores(root: Path, timeout: float = 30.0) -> None:
     """Wait out every background core start a test's ops kicked, stop every
-    core under ``root``, and fail the test if one survives (killing it)."""
+    core under ``root``, end the process groups recorded under it, and fail
+    the test if a core or kick survives (killing it). The same on every
+    platform."""
     import signal
     import time
 
-    if not sys.platform.startswith("linux"):
-        stop_cores(root)
-        return
     end = time.monotonic() + timeout
     while _processes_for(root, "x-kick-core") and time.monotonic() < end:
         time.sleep(0.05)
@@ -153,6 +227,8 @@ def teardown_cores(root: Path, timeout: float = 30.0) -> None:
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+    if os.path.isdir(root):
+        pgroups.kill_groups(pgroups.read_groups([str(root)]), term_grace_s=1.0)
     assert not leaked, f"standalone fake cores or kicks outlived the test: {leaked}"
 
 
