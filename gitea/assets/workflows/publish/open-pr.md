@@ -14,9 +14,11 @@ python3 "$GITEA_PR" open-pr --head "$HEAD_BRANCH" --base "$BASE_BRANCH" \
 
 `--base` is the rig `default_branch` from `gc rig list --json`. The script
 prints JSON with `url`, `number`, `state` and `created`; `created=false` means
-an existing open PR was reused. Record `gc.build.publish_pr_url`,
-`gc.build.publish_pr_number` and `gc.build.publish_forge=gitea` on the workflow
-root, and name the PR URL and state in the close reason.
+an existing open PR was reused. Record `gc.build.pr_url` and
+`gc.build.pr_number` (the script's `url` and `number`; the keys GitHub run
+roots carry and run-finished notifiers read), plus `gc.build.publish_pr_url`,
+`gc.build.publish_pr_number` and `gc.build.publish_forge=gitea`, on the
+workflow root, and name the PR URL and state in the close reason.
 
 On a nonzero exit the script prints `{"error": "<code>", "message": "..."}` on
 stderr. Record `gc.outcome=fail` and `gc.failure_class=<code>` (for example

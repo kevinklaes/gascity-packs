@@ -109,7 +109,8 @@ If push is not authorized, skip to step 7 with `noop` or the disabled reason.
 If `open_pr` is false, stop after the push. Record
 `gc.build.publish_action=push`, `gc.build.publish_status=published`,
 `gc.publish_outcome=pushed` and `gc.publish_mode=push`. Do not run the script's
-`open-pr` subcommand, so the token is never read.
+`open-pr` subcommand, so the token is never read. Write no PR keys on the
+workflow root.
 
 ## 4. Prepare the title and body
 
@@ -188,9 +189,34 @@ and on the workflow root bead:
 - `gc.build.publish_artifact_path=<publish result artifact path>`
 - `gc.build.publish_reason=<short machine-readable reason>`
 - `gc.build.publish_remote_status=<whether origin was present and reachable>`
+
+When the script's `open-pr` succeeded, whether it opened a PR
+(`created=true`) or reused an open one (`created=false`), the root also gets
+these, with `gc.build.publish_status=published` and
+`gc.build.publish_action=push_pr`:
+
+- `gc.build.pr_url=<url from the script>` (the key GitHub run roots carry and
+  run-finished notifiers read)
+- `gc.build.pr_number=<number from the script>` (the same key as on GitHub run
+  roots; the bare integer, e.g. `4`)
 - `gc.build.publish_pr_url=<url from the script>` (gitea pack addition)
 - `gc.build.publish_pr_number=<number from the script>` (gitea pack addition)
 - `gc.build.publish_forge=gitea` (gitea pack addition)
+
+For example, with the root id from this step's `gc.root_bead_id`:
+
+```bash
+gc bd update "<workflow-root-id>" \
+  --set-metadata 'gc.build.pr_url=<url>' \
+  --set-metadata 'gc.build.pr_number=<number>' \
+  --set-metadata 'gc.build.publish_pr_url=<url>' \
+  --set-metadata 'gc.build.publish_pr_number=<number>' \
+  --set-metadata 'gc.build.publish_forge=gitea' \
+  --set-metadata 'gc.build.publish_status=published' \
+  --set-metadata 'gc.build.publish_action=push_pr'
+```
+
+Push-only, no-op and failed publishes write none of the PR keys.
 
 The final report's publish fields use the same names as the gascity flow. When
 a PR was opened or reused, close with its URL and state:

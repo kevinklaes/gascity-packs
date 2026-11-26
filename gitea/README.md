@@ -153,13 +153,25 @@ gets `gc.build.publish_status`, `gc.build.publish_action`,
 `gc.build.publish_reason` and `gc.build.publish_remote_status`, with the same
 values and meanings as on the gh path.
 
-This pack adds three root keys. The gh path doesn't record them today:
+When a PR is opened or reused, the root also gets the PR identity, under the
+same keys GitHub run roots carry, so tools that read a run's PR (such as a
+run-finished notifier) need no forge-specific code:
+
+| Key | Value |
+| --- | --- |
+| `gc.build.pr_url` | The PR's web URL (`html_url`) |
+| `gc.build.pr_number` | The PR number |
+
+This pack also writes three keys of its own, with the same PR identity plus
+the forge name:
 
 | Key | Value |
 | --- | --- |
 | `gc.build.publish_pr_url` | The PR's web URL (`html_url`) |
 | `gc.build.publish_pr_number` | The PR number |
 | `gc.build.publish_forge` | `gitea` |
+
+Push-only, no-op and failed publishes write none of these.
 
 ## Configuration
 

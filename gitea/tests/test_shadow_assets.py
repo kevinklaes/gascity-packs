@@ -6,7 +6,9 @@ silently stops applying, so the paths are pinned against both packs here. The
 metadata contract is pinned too (REQ-010, AC6): every `gc.*` key a gascity
 asset asks for must appear in its shadow. The build-basic shadow is checked
 against the union of build-basic and build-base, because build-basic's publish
-step loads only that one file (plan amendment A1).
+step loads only that one file (plan amendment A1). The `gc.build.pr_url` and
+`gc.build.pr_number` keys are pinned too, because run-finished notifiers read
+them to find a run's PR.
 """
 
 from __future__ import annotations
@@ -44,6 +46,15 @@ NOT_WRITTEN = re.compile(r"^gc\.(var|publisher|run-operator)\b")
 
 GITEA_ADDITIONS = ("gc.build.publish_pr_url", "gc.build.publish_pr_number", "gc.build.publish_forge")
 
+# The PR keys GitHub run roots carry and run-finished notifiers read.
+CANONICAL_PR_KEYS = ("gc.build.pr_url", "gc.build.pr_number")
+
+PR_RECORDING_SHADOWS = (
+    "workflows/build-basic/publish.md",
+    "workflows/build-base/publish.md",
+    "workflows/publish/open-pr.md",
+)
+
 NOOP_BLOCK = """\
 gc bd update "$CLAIMED_BEAD_ID" \\
   --set-metadata 'gc.outcome=pass' \\
@@ -72,6 +83,13 @@ def keys(text: str) -> set[str]:
     return {key for key in METADATA_KEY.findall(text) if not NOT_WRITTEN.match(key)}
 
 
+def section(text: str, heading: str) -> str:
+    """Return one `## ` section, from its heading up to the next `## ` heading."""
+    start = text.index(f"\n## {heading}")
+    end = text.find("\n## ", start + 1)
+    return text[start : end if end != -1 else len(text)]
+
+
 @pytest.mark.parametrize("rel", SHADOWED)
 def test_shadowed_path_exists_in_both_packs(rel: str) -> None:
     assert GASCITY_ASSETS.joinpath(rel).is_file(), (
@@ -98,12 +116,44 @@ def test_shadow_names_every_key_its_gascity_asset_requires(rel: str) -> None:
     assert not missing, f"gitea assets/{rel} drops gascity metadata keys: {sorted(missing)}"
 
 
-@pytest.mark.parametrize("rel", ["workflows/build-basic/publish.md", "workflows/build-base/publish.md", "workflows/publish/open-pr.md"])
+@pytest.mark.parametrize("rel", PR_RECORDING_SHADOWS)
 def test_pr_identity_keys_are_recorded(rel: str) -> None:
     text = read(GITEA_ASSETS, rel)
     for key in GITEA_ADDITIONS:
         assert key in text, f"{rel} does not record {key}"
     assert "gc.build.publish_forge=gitea" in text
+
+
+@pytest.mark.parametrize("rel", PR_RECORDING_SHADOWS)
+def test_canonical_pr_keys_are_recorded(rel: str) -> None:
+    text = read(GITEA_ASSETS, rel)
+    for key in CANONICAL_PR_KEYS:
+        assert key in text, f"{rel} does not record {key}; run-finished notifiers read it"
+
+
+def test_no_pr_paths_write_no_pr_keys() -> None:
+    text = read(GITEA_ASSETS, "workflows/build-basic/publish.md")
+    no_pr = {
+        "preamble": text[: text.index("\n## Inputs")],
+        "push only": section(text, "3. Stop here"),
+        "failure": section(text, "6. Failure handling"),
+    }
+    for name, body in no_pr.items():
+        for key in CANONICAL_PR_KEYS + GITEA_ADDITIONS:
+            assert key not in body, f"the {name} path of build-basic/publish.md writes {key}"
+
+
+def test_build_basic_pr_block_sets_published_push_pr() -> None:
+    step7 = section(read(GITEA_ASSETS, "workflows/build-basic/publish.md"), "7. Record the result")
+    for needle in (
+        "gc.build.pr_url=",
+        "gc.build.pr_number=",
+        "created=false",
+        "gc.build.publish_status=published",
+        "gc.build.publish_action=push_pr",
+        "none of the PR keys",
+    ):
+        assert needle in step7, f"step 7 lacks {needle!r}"
 
 
 def test_build_basic_shadow_keeps_the_noop_contract() -> None:
