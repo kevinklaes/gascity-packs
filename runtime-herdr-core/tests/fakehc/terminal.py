@@ -20,6 +20,8 @@ import threading
 import time
 from typing import Any, Dict, IO, List, Mapping, Optional, Sequence
 
+from .groups import record_group
+
 TAIL_BYTES = 64 << 10
 SCREEN_ROWS = 120
 SCREEN_COLS = 200
@@ -109,8 +111,10 @@ class FakeTerminal:
         env: Mapping[str, str],
         keep: bool,
         restart_delay_s: float = KEPT_RESTART_S,
+        pgroups_file: Optional[str] = None,
     ) -> None:
         self.address = address
+        self._pgroups_file = pgroups_file
         self.created_seq = 0  # the core's counter for this address
         self.name = name
         self.labels = labels
@@ -167,6 +171,7 @@ class FakeTerminal:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        record_group(self._pgroups_file, proc.pid)
         self.pid = proc.pid
         incarnation = self._incarnation
         for target in (self._read_output, self._await_exit):

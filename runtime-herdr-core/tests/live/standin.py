@@ -11,11 +11,15 @@ verb gc's ``IsCityInfrastructureArgv`` recognises:
   ``GC_HC_LIVE_STORE_DELAY`` (seconds) it waits that long before it binds,
   as a store slow to start does;
 * ``db-proxy-child``: sleeps, standing in for bd's proxy.
+
+Every role ends on ``SIGTERM`` (the default action), even when the parent
+that started it ignored the signal: :func:`main` restores the default first.
 """
 
 from __future__ import annotations
 
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -51,11 +55,12 @@ def _watchdog(sock: str, pid_file: str) -> int:
         handle.write(str(child.pid))
     os.replace(tmp, pid_file)
     child.wait()
-    while True:  # a watchdog outlives its store; the test reads both
+    while True:  # a watchdog outlives its store (the tests read both); SIGTERM still ends it
         time.sleep(3600)
 
 
 def main(argv: List[str]) -> int:
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)  # an inherited SIG_IGN must not make it immortal
     role = os.path.basename(argv[0])
     if role == "__gc-managed-dolt-scope-watchdog":
         return _watchdog(argv[1], argv[2])

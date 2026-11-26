@@ -44,7 +44,10 @@ dialog shows, ``prompt`` after.
 Environment: ``GC_HC_LIVE_DIR``, ``GC_HC_LIVE_AGENT``, ``GC_HC_LIVE_STANDINS``
 (the stand-in directory), ``GC_HC_LIVE_PYTHON``, optional
 ``GC_HC_LIVE_SPAWN`` (comma list), ``GC_HC_LIVE_INFRA_UNIT``,
-``GC_HC_LIVE_ECHO`` (printed to the screen once) and ``GC_HC_LIVE_MODE``.
+``GC_HC_LIVE_ECHO`` (printed to the screen once), ``GC_HC_LIVE_MODE`` and
+``GC_HC_LIVE_PGROUPS``: the harness's process-group registry, to which each
+detached process is appended (``<pgid> <epoch>``) the moment it starts, so
+teardown can end it even if this agent dies before it reports.
 """
 
 from __future__ import annotations
@@ -52,6 +55,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -78,6 +82,7 @@ TRUST_DIALOG = (
 CLEAR = "\x1b[2J\x1b[3J\x1b[H"
 """Clear the screen and the scrollback, so no read finds the dialog after it."""
 RELEASE_POLL_S = 0.2
+PGROUPS_ENV = "GC_HC_LIVE_PGROUPS"
 
 
 def osc7501(state: str, kind: str = "") -> str:
@@ -99,6 +104,23 @@ def _write_json(path: str, doc: Dict[str, object]) -> None:
     os.replace(tmp, path)
 
 
+def _record_group(pid: int) -> None:
+    """Append ``pid`` (it leads its own group) to the harness's registry."""
+    path = os.environ.get(PGROUPS_ENV, "")
+    if not path:
+        return
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    except OSError:
+        return
+    try:
+        os.write(fd, f"{pid} {time.time():.3f}\n".encode())
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
 def _detached(argv: List[str], cwd: str) -> int:
     proc = subprocess.Popen(
         argv,
@@ -108,6 +130,7 @@ def _detached(argv: List[str], cwd: str) -> int:
         stderr=subprocess.DEVNULL,
         start_new_session=True,
     )
+    _record_group(proc.pid)
     return proc.pid
 
 
@@ -204,7 +227,9 @@ def spawn_witness(standins: str, python: str) -> int:
         timeout=30,
         check=True,
     )
-    return int(done.stdout.strip())
+    pid = int(done.stdout.strip())
+    _record_group(pid)
+    return pid
 
 
 def _probe_hc(work: str, name: str) -> None:
@@ -225,6 +250,7 @@ def _probe_hc(work: str, name: str) -> None:
 
 
 def main() -> int:
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)  # an inherited SIG_IGN must not make it immortal
     work = os.environ["GC_HC_LIVE_DIR"]
     name = os.environ["GC_HC_LIVE_AGENT"]
     standins = os.environ.get("GC_HC_LIVE_STANDINS", "")
