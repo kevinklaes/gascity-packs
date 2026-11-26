@@ -305,3 +305,12 @@ model-backed formula gate in `scripts/gascity_pack_inference_gate.py`, plus a
 scheduled supported-pack nightly workflow. See
 [Release Compatibility Testing](./docs/design/release-compatibility-testing.md)
 for the release-time and nightly test contract.
+
+### CI on a fork
+
+CI jobs run on Blacksmith runners by default. The runner label comes from the
+repository variable `CI_RUNNER`: when it is unset or empty, each job uses its
+usual Blacksmith runner. A fork without Blacksmith runners can set it, for
+example to `ubuntu-latest`, under Settings → Secrets and variables → Actions →
+Variables, or with `gh variable set CI_RUNNER --body ubuntu-latest`; every job
+then runs on that label. Without it, a fork's jobs stay queued.
