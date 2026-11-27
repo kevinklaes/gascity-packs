@@ -42,6 +42,8 @@ from gc_live_city import (  # noqa: E402
 GITEA = REPO_ROOT / "gitea"
 ROLES = REPO_ROOT / "gascity" / "roles"
 SCRIPT = GITEA / "assets" / "scripts" / "gitea_pr.py"
+CI_GATE_SCRIPT = REPO_ROOT / "gascity" / "assets" / "scripts" / "ci_gate.py"
+CI_GATE_CHECK = REPO_ROOT / "gascity" / "assets" / "scripts" / "checks" / "ci-gate.sh"
 
 BUILD_BASIC_PUBLISH = "build-basic.publish"
 HELPER_STEPS = {
@@ -80,10 +82,10 @@ def step_descriptions(doc: dict) -> dict[str, str]:
     return {step["id"]: step.get("description", "") for step in doc["steps"]}
 
 
-def locate_script(doc: dict) -> Path | None:
-    """The locator the shadow prompt runs: highest layer shipping gitea_pr.py."""
+def locate_script(doc: dict, name: str = "gitea_pr.py") -> Path | None:
+    """The locator the prompts and ci_gate.py run: highest layer shipping the script."""
     for layer in reversed(doc["search_paths"]):
-        candidate = Path(layer).parent / "assets" / "scripts" / "gitea_pr.py"
+        candidate = Path(layer).parent / "assets" / "scripts" / name
         if candidate.is_file():
             return candidate
     return None
@@ -173,3 +175,65 @@ def test_importing_the_pack_adds_no_warnings(gc_test_bin, cities) -> None:  # no
     assert not added, f"importing gitea added warnings: {sorted(added)}"
     output = gc_output(gc_test_bin, cities["imports"], "config", "show", "--validate")
     assert "Config valid." in output
+
+
+# --------------------------------------------------------------------------
+# build-basic's CI gate and merge (ci-gate-merge REQ-014, REQ-016, AC-1)
+
+
+def formula_with(gc_bin: Path, workspace, *extra: str) -> dict:
+    result = run_gc(gc_bin, workspace, "formula", "show", "build-basic", "--rig", "demo", *extra, "--json")
+    assert result.returncode == 0, f"gc formula show build-basic failed:\n{result.stdout}{result.stderr}"
+    return json.loads(result.stdout)
+
+
+@pytest.mark.parametrize("city", ["imports", "plain"])
+def test_ci_steps_compile_in_only_with_open_pr(gc_test_bin, cities, city) -> None:  # noqa: F811
+    doc = formula_with(gc_test_bin, cities[city], "--var", "open_pr=true")
+    steps = {step["id"]: step for step in doc["steps"]}
+    ids = list(steps)
+    for step_id in ("build-basic.ci-gate", "build-basic.ci-gate.iteration.1", "build-basic.ci-merge"):
+        assert step_id in steps, f"{city}: {step_id} missing from {ids}"
+    assert ids.index("build-basic.publish") < ids.index("build-basic.ci-gate") < ids.index("build-basic.ci-merge")
+    assert ids[-1] == "build-basic.workflow-finalize"
+
+    gate = steps["build-basic.ci-gate"]["metadata"]
+    assert gate["gc.kind"] == "ralph" and gate["gc.check_mode"] == "exec"
+    assert gate["gc.max_attempts"] == "11"
+    # The check always comes from gascity: sibling packs may not shadow it.
+    assert Path(gate["gc.check_path"]).resolve() == CI_GATE_CHECK.resolve()
+    assert steps["build-basic.ci-merge"]["metadata"]["gc.run_target"] == "gc.publisher"
+    assert "explicit authorization to merge" in steps["build-basic.ci-merge"]["description"]
+
+    plain = formula_with(gc_test_bin, cities[city])
+    assert not [step["id"] for step in plain["steps"] if ".ci-" in step["id"]], "open_pr=false must compile the CI steps out"
+
+
+def sandbox_env(workspace) -> dict:
+    """gc's check sandbox: HOME=<city root>, a narrow PATH, GC_CITY_PATH and nothing else (RA-3)."""
+    return {
+        "PATH": ":".join(dict.fromkeys([str(Path(sys.executable).parent), "/usr/local/bin", "/usr/bin", "/bin"])),
+        "HOME": str(workspace.city_dir),
+        "GC_HOME": workspace.env["GC_HOME"],
+        "GC_CITY_PATH": str(workspace.city_dir),
+    }
+
+
+@pytest.mark.parametrize(("city", "gitea_found"), [("imports", True), ("plain", False)])
+def test_ci_scripts_are_locatable_under_the_check_sandbox_env(gc_test_bin, cities, city, gitea_found) -> None:  # noqa: F811
+    """ci_gate.py finds gitea_pr.py (and the merge prompt finds ci_gate.py) with gc's scrubbed check env."""
+    workspace = cities[city]
+    env = sandbox_env(workspace)
+    env["PATH"] = f"{Path(gc_test_bin).parent}:{env['PATH']}"
+    result = subprocess.run(
+        [str(gc_test_bin), "formula", "show", "build-basic", "--rig", "demo", "--json"],
+        cwd=workspace.city_dir, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    doc = json.loads(result.stdout)
+    assert locate_script(doc, "ci_gate.py").resolve() == CI_GATE_SCRIPT.resolve()
+    located = locate_script(doc, "gitea_pr.py")
+    if gitea_found:
+        assert located is not None and located.resolve() == SCRIPT.resolve()
+    else:
+        assert located is None

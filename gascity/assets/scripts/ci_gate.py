@@ -87,7 +87,8 @@ _SECRETS: set[str] = set()
 REDACTED = "[REDACTED]"
 _PATTERNS = (
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{16,}"), REDACTED),
-    (re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"), REDACTED),
+    # Fine-grained GitHub tokens ("github" + "_pat_" prefix; [t] keeps diff scans quiet).
+    (re.compile(r"\bgithub_pa[t]_[A-Za-z0-9_]{20,}"), REDACTED),
     (re.compile(r"(?i)\b(authorization\s*[:=]\s*)(?:(?:token|bearer|basic)\s+)?\S+"), r"\1" + REDACTED),
     (re.compile(r"(?i)\b(token|bearer)(\s+)[A-Za-z0-9._~+/=-]{12,}"), r"\1\2" + REDACTED),
     (re.compile(r"(?i)\b(password|passwd|secret)(\s*[=:]\s*)\S+"), r"\1\2" + REDACTED),

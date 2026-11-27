@@ -19,7 +19,9 @@ Does:
   gascity's; only the prose changes.
 - Ship `assets/scripts/gitea_pr.py`, a standard-library Python script that
   parses `origin`, reads the bot token from a file, and finds or creates the PR
-  (`GET`/`POST /api/v1/repos/{owner}/{repo}/pulls`).
+  (`GET`/`POST /api/v1/repos/{owner}/{repo}/pulls`). For `build-basic`'s CI
+  gate it also reads a PR's head commit statuses and Actions job logs, and
+  squash-merges a PR (see "CI gate and merge").
 - Ship two pack commands, `gitea open-pr` and `gitea parse-origin`, that wrap
   the script.
 
@@ -27,8 +29,11 @@ Doesn't:
 
 - Change the gascity pack, its agents, or rigs that don't import this pack.
 - Touch the GitHub issue-fix or PR-review workflows.
-- Merge, approve, label, assign reviewers, or comment on PRs. No Gitea issues,
-  webhooks, status checks, or Actions.
+- Merge, except through `build-basic`'s `ci-merge` step, when CI is green (or
+  absent) and `merge` is true.
+- Approve, label, assign reviewers, or comment on PRs. No Gitea issues or
+  webhooks. It reads commit statuses and Actions logs, but never re-runs or
+  cancels Actions.
 - Create the bot account or its token. That's an operator task, described
   below.
 - Open draft or `WIP:` PRs.
@@ -162,16 +167,63 @@ run-finished notifier) need no forge-specific code:
 | `gc.build.pr_url` | The PR's web URL (`html_url`) |
 | `gc.build.pr_number` | The PR number |
 
-This pack also writes three keys of its own, with the same PR identity plus
-the forge name:
+This pack also writes keys of its own, with the same PR identity plus what
+`build-basic`'s CI gate and merge read:
 
 | Key | Value |
 | --- | --- |
 | `gc.build.publish_pr_url` | The PR's web URL (`html_url`) |
 | `gc.build.publish_pr_number` | The PR number |
 | `gc.build.publish_forge` | `gitea` |
+| `gc.build.publish_api_base`, `gc.build.publish_owner`, `gc.build.publish_repo` | The script's `api_base`, `owner` and `repo` |
+| `gc.build.pr_head_branch`, `gc.build.pr_head_worktree` | The PR's head branch and the worktree holding it |
 
-Push-only, no-op and failed publishes write none of these.
+Push-only, no-op and failed publishes write none of these. They record
+`gc.build.merge_status=skipped:no_pr` instead.
+
+## CI gate and merge
+
+With `open_pr=true`, gascity's `build-basic` waits for the PR's CI after
+publish, sends red CI back to the builder for fix rounds on the same branch,
+and squash-merges on green. The gascity README's "CI gate and merge
+(build-basic)" section has the full description. On a rig that imports this
+pack:
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `merge` | `true` | `false` leaves the PR open after green CI (`skipped:merge_false`). |
+| `ci_fix_rounds` | `3` | Red-CI fix rounds before the run fails (`ci_red`); clamped to 0..10. |
+| `ci_timeout_minutes` | `90` | The wait per gate round; clamped to 1..240. |
+
+- **The gate** (gascity's `checks/ci-gate.sh`, an exec check with no model)
+  finds this pack's `gitea_pr.py` through `search_paths` and runs `ci-status`:
+  the PR's head sha, then `GET
+  /api/v1/repos/{owner}/{repo}/commits/{sha}/status`, paged. Per context,
+  `pending` waits; `success`, `warning` and `skipped` pass; `failure` and
+  `error` are red. Only-skipped is green even when the combined state says
+  `pending`. No status within 5 minutes of the first round means no CI, and
+  the PR merges.
+- **Read token for the gate.** gc runs checks without the publisher's
+  environment, so the gate never sees `GC_GITEA_TOKEN_FILE`. Give it a
+  read-only token (`read:repository`) in the city's `.gc/ci-gate.json`, keyed
+  by the API base's `host:port`, for example
+  `{"token_files": {"gitea.example:3001": "/home/ops/.config/gitea/ci-read.token"}}`.
+  Without it, every PR-opening run fails with `ci_unreadable` and does not
+  merge.
+- **Write token for the merge.** `ci-merge` runs in the publisher's session.
+  `gitea_pr.py merge` reads `GC_GITEA_TOKEN_FILE` there, and nothing else
+  does. It sends `POST /api/v1/repos/{owner}/{repo}/pulls/{n}/merge` with
+  `{"Do": "squash", "delete_branch_after_merge": true, "head_commit_id":
+  "<sha CI judged>"}`. Its API base comes only from the checkout's origin and
+  `GC_GITEA_BASE_URL`. It refuses (`failed:repo_mismatch`) when that differs
+  from the repo the publish recorded.
+- A refused merge (branch protection, conflict, permission) records
+  `gc.build.merge_status=failed:http_<code>`, leaves the PR open and fails the
+  run. Nothing retries it.
+- The gate holds the rig's serial control lane while it waits, so other runs
+  in the rig pause at their next check until it returns.
+- **Rollout:** create `.gc/ci-gate.json` first. Then import gascity from a
+  version that has the steps, and bump this pack to the same version.
 
 ## Configuration
 
@@ -224,14 +276,19 @@ Create a dedicated, restricted Gitea user for the token, for example `gc-bot`:
 - Not a site admin, and not an organization owner.
 - A collaborator on only the repos it publishes to, with **write** access: what
   is needed to push a branch and open a PR. Give no admin access to the repo.
-- Not on any branch-protection allowlist. It must not be able to push to, or
-  merge into, the protected default branch, nor bypass required reviews. Merges
-  stay with people.
+- It must not push to the protected default branch or bypass required
+  reviews. To let `build-basic` merge green PRs, allow `gc-bot` to merge into
+  the base branch (the branch protection's merge allowlist). Without that, a
+  merge is refused with `failed:http_<code>` (for example `http_405`), the PR
+  stays open, and a person merges it. Granting the permission is an operator
+  task.
 - Scope its access token to repositories only (`write:repository`), with no
   admin, organization or user scopes.
+- Give the CI gate a second, read-only token (`read:repository`). Never put the
+  write token in `.gc/ci-gate.json`.
 
-Pushes go over SSH with the publisher's own key. The token is used only for the
-pull-request API.
+Pushes go over SSH with the publisher's own key. The write token is used only
+for the pull-request API: opening PRs and the `ci-merge` step's merge.
 
 ## Errors and the manual fallback
 

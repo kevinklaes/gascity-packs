@@ -102,7 +102,7 @@ def test_green_records_verdict_and_uses_the_token_only_in_gh_env(h) -> None:
 
 def test_red_with_rounds_left_writes_capped_redacted_findings_and_exits_1(h) -> None:
     log = "\n".join([f"step line {i}" for i in range(300)] + [
-        f"leaked {TOKEN}", "Authorization: token abcdefabcdefabcdef", "ghp_" + "a" * 36, "password=hunter2",
+        f"leaked {TOKEN}", "Authorization: token abcdefabcdefabcdef", "ghs_" + "a" * 36, "password=hunter2",
         "FAILED tests/test_x.py::test_y",
     ])
     h.gh("pr view", view())
@@ -123,7 +123,7 @@ def test_red_with_rounds_left_writes_capped_redacted_findings_and_exits_1(h) -> 
     assert "step line 0\n" not in text, "the tail keeps only the last 80 lines"
     tail = text.split("```text\n", 1)[1].split("\n```", 1)[0]
     assert len(tail.splitlines()) <= 80 and len(tail.encode()) <= 8 * 1024
-    for secret in (TOKEN, "abcdefabcdefabcdef", "ghp_" + "a" * 36, "hunter2"):
+    for secret in (TOKEN, "abcdefabcdefabcdef", "ghs_" + "a" * 36, "hunter2"):
         assert secret not in text
     run_view = gh_calls(h, "run view")
     assert run_view and run_view[0]["argv"] == ["run", "view", "--job", "21", "--repo", "acme/demo-app", "--log-failed"]

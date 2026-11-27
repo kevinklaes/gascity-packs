@@ -144,6 +144,8 @@ launch or pin them in a rig's `formula_vars`:
 | `drain_policy` | `separate` | `separate` runs implementation beads in parallel worker sessions; `same-session` runs them serially in one shared session. |
 | `implementation_target` | `gc.implementation-worker` | The rig role that implements each work item. |
 | `push` / `open_pr` | `false` | Allow the publish stage to push and open a PR after all checks pass. |
+| `merge` | `true` | `build-basic` only, with `open_pr=true`: squash-merge the PR once CI is green. See "CI gate and merge (build-basic)". |
+| `ci_fix_rounds` / `ci_timeout_minutes` | `3` / `90` | `build-basic` only, with `open_pr=true`: red-CI fix rounds and the per-round CI wait. |
 | `max_iterations` | `10` | Bound on implementation/review fix attempts. |
 
 When variables are not enough, every stage prompt can be replaced by dropping
@@ -340,7 +342,8 @@ flowchart TD
 
     ReviewDone --> Finalize["finalize<br/>build-basic summary"]:::basic
     Finalize --> Publish["publish<br/>build-basic or build-base no-op/push/PR"]:::basic
-    Publish --> Done["workflow complete"]:::terminal
+    Publish --> CIGate["ci-gate + ci-merge<br/>build-basic, open_pr=true only"]:::basic
+    CIGate --> Done["workflow complete"]:::terminal
 ```
 
 Blue nodes are the base contract or inherited item lifecycle, green nodes are
@@ -351,6 +354,127 @@ or finalization while preserving the convoy/drain/fan-in mechanics. The
 `build-basic` review step is intentionally single-lane; packs such as
 Superpowers, Compound Engineering, and BMAD replace it with expansion formulas
 whose reviewer beads fan out before synthesis.
+
+## CI gate and merge (build-basic)
+
+With `open_pr=true`, `build-basic` does not stop at the pull request. Two steps
+follow `publish`, and a run without `open_pr=true` compiles them out and
+behaves exactly as before:
+
+1. **`ci-gate`** is a check loop. Its check, `assets/scripts/checks/ci-gate.sh`
+   (`ci_gate.py wait`), is a script: it waits for the PR's CI with no agent
+   session and no model tokens, then records the verdict on the run root. Its
+   subject is the fix round, on `{{implementation_target}}`, so `--var
+   implementation_target=<tier>` picks the builder for fixes too. Round 1's
+   subject has nothing to fix and closes at once. On red, the gate writes a
+   findings file and exits 1, which starts the next fix round: the worker
+   commits to the PR's existing branch, pushes with a plain `git push`, and the
+   gate judges the new head sha. Fix rounds never force-push, open a new PR or
+   branch, push an empty commit, or re-run or cancel CI jobs.
+2. **`ci-merge`** is a short `gc.publisher` turn that runs `ci_gate.py merge`.
+   It is the run's only merge, and its prompt is the bead's explicit merge
+   authorization, scoped by `merge`. On green (or no CI) with `merge=true` it
+   squash-merges and deletes the branch, pinned to the head sha CI judged
+   (`gh pr merge --squash --delete-branch --match-head-commit`, or the gitea
+   pack's `gitea_pr.py merge`). A red, timed-out or unreadable verdict, or a
+   refused merge, fails the step and leaves the PR open.
+
+| Variable | Default | Effect | Clamp |
+| --- | --- | --- | --- |
+| `merge` | `true` | `false` leaves the PR open after green CI (`merge_status=skipped:merge_false`); the gate and fix rounds still run. | `false`, `0`, `no`, `off` mean false |
+| `ci_fix_rounds` | `3` | Red-CI fix rounds before the run fails with `ci_red`. | 0..10 |
+| `ci_timeout_minutes` | `90` | How long each gate round waits. Each round has its own timer, which starts when the check starts, so a fix round queued behind the builder cap does not use it up. | 1..240 |
+
+How the gate reads CI:
+
+- **GitHub:** `gh pr view` and `gh pr checks` on the PR. Pending, queued and
+  in-progress checks keep it waiting; passing and skipped checks pass; failing,
+  cancelled, timed-out, action-required and unknown checks are red.
+- **Gitea** (rigs that import the `gitea` pack): the pack's `gitea_pr.py
+  ci-status`, which reads the PR's head sha and that commit's statuses.
+  `pending` waits; `success`, `warning` and `skipped` pass; `failure` and
+  `error` are red. A set of only skipped statuses is green even when Gitea's
+  combined state says `pending`.
+- It polls every 60 seconds, each request with a 30-second timeout. If gc
+  re-runs the check (a dispatcher restart), the round resumes its deadline
+  from `gc.build.ci_round_started` instead of restarting it.
+
+**No CI.** If no check or status appears within **5 minutes** of the first
+gate round, the repo is taken to have no CI for pull requests:
+`ci_status=none`, and the PR merges right away (subject to `merge`). Later
+rounds never conclude "no CI". CI existed (it was red), so a slow start after
+a fix push keeps them waiting until the round's timeout.
+
+**Findings.** A red round writes `<artifact_root>/ci/round-<n>-findings.md`
+outside every worktree: each failing check's name, state, description, URL and
+log tail (`gh run view --log-failed`, or the Gitea Actions job log when the
+server exposes it). Tails keep the last 80 lines / 8 KiB per check, and a file
+is capped at 32 KiB. Tokens, `Authorization` headers, GitHub token-shaped
+strings and `password=`/`secret=` pairs are redacted. Never commit the file.
+
+### Gate credentials: `.gc/ci-gate.json`
+
+gc runs checks in a sandbox (HOME set to the city root, a narrow PATH, none of
+the rig's override environment), so the gate cannot use the publisher's
+login. It reads a read token per API host from `<city>/.gc/ci-gate.json`:
+
+```json
+{
+  "token_files": {
+    "github.com": "/home/ops/.config/gc/github-ci-read.token",
+    "gitea.example:3001": "/home/ops/.config/gitea/ci-read.token",
+    "192.0.2.10:3000": "/home/ops/.config/gitea/lab-ci-read.token"
+  }
+}
+```
+
+- The key is the `host[:port]` of the PR's API base, so a token only ever goes
+  to its own host. Bead metadata never names a file to read.
+- Use **read-only** tokens: on GitHub a fine-grained token with read access to
+  pull requests, checks and actions; on Gitea a `read:repository` token. The
+  merge never uses them. It runs in the publisher's session with the
+  publisher's write credentials.
+- A GitHub token reaches `gh` only as `GH_TOKEN` in the child's environment,
+  with `GH_CONFIG_DIR` set to a per-run temp dir. A Gitea token file goes to
+  `gitea_pr.py --token-file`. Tokens never appear in argv, output, metadata,
+  findings or logs.
+- A missing file or entry, an unreadable token, `gh` missing from the gate's
+  PATH, or a 401/403 fails fast: `ci_status=timeout`,
+  `ci_reason=unreadable:<code>`, `merge_status=skipped:ci_unreadable`, and the
+  run fails with `ci_unreadable`. It never merges unverified.
+
+### Metadata
+
+Every run whose publish opened or reused a PR ends with these on the workflow
+root:
+
+| Key | Values |
+| --- | --- |
+| `gc.build.ci_status` | `green`, `red`, `timeout`, `none` |
+| `gc.build.ci_rounds` | Fix rounds that ran (integer; `0` when the first gate decided) |
+| `gc.build.merge_status` | `merged`, `skipped:merge_false`, `skipped:ci_red`, `skipped:ci_timeout`, `skipped:ci_unreadable`, `skipped:already_merged`, `skipped:pr_closed`, or `failed:<code>` (`http_405`, `gh_exit_1`, `head_moved`, `repo_mismatch`, ...) |
+
+A run that opened no PR gets `gc.build.merge_status=skipped:no_pr` and no
+`ci_status`. Supporting keys: `gc.build.ci_reason` (failing check names,
+`timeout_after_<n>m`, `unreadable:<code>`, `no_ci_within_<n>s`,
+`no_fix_pushed`), `gc.build.ci_head_sha`, `gc.build.ci_findings_path` and
+`gc.build.ci_round_started`. The publish step records what the gate reads:
+`gc.build.pr_url`, `gc.build.pr_number`, `gc.build.publish_forge`,
+`gc.build.pr_head_branch` and `gc.build.pr_head_worktree`.
+
+### Limits and rollout
+
+- **The gate holds the rig's control lane.** Each rig has one serial
+  control-dispatcher, and it runs check scripts one at a time. While a gate
+  waits (up to `ci_timeout_minutes` per round), other runs in the same rig
+  pause at their next check or fanout. They are delayed, not failed.
+- Round 1 always spends one short `{{implementation_target}}` turn that only
+  closes, because a check loop runs its subject before its check.
+- **Rollout:** first create `.gc/ci-gate.json` and its read tokens in the city,
+  then move the city's gascity import to a version that has these steps. A
+  rig on the new version without the file fails every PR-opening run with
+  `ci_unreadable`. Rigs that import `gc` from another source keep their
+  current publish-only behavior.
 
 ## Stable Workflow Override Interface
 
