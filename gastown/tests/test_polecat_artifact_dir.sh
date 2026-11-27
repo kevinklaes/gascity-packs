@@ -806,6 +806,13 @@ test_workspace_collision_fails_closed_without_alternate() {
                 "runtime drain-ack")
                     return 0
                     ;;
+                # Step 1's stage-marker clear and base_ref record run
+                # before the artifact checks by design; neither names an
+                # artifact path.
+                "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
+                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main")
+                    return 0
+                    ;;
                 "$bd_subcommand update "*)
                     fail "canonical collision reached a metadata update"
                     ;;
@@ -822,6 +829,16 @@ test_workspace_collision_fails_closed_without_alternate() {
         source "$setup"
     ); then
         fail "invalid canonical-path collision did not stop workspace creation"
+    fi
+
+    grep -qxF "$bd_subcommand show ac-safe1 --json" "$calls" &&
+        [[ "$(tail -n 1 "$calls")" == "runtime drain-ack" ]] ||
+        fail "canonical collision test stopped before the artifact checks"
+    if grep "^${bd_subcommand} update " "$calls" |
+        grep -v -x -e "${bd_subcommand} update ac-safe1 --unset-metadata handoff_stage" \
+            -e "${bd_subcommand} update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" |
+        grep -q .; then
+        fail "canonical collision mutated work bead metadata"
     fi
 
     grep -qF 'preserve me' "$canonical/recovery.txt" ||
@@ -872,6 +889,13 @@ test_workspace_rejects_redirected_artifact_root_before_creation() {
                 "runtime drain-ack")
                     return 0
                     ;;
+                # Step 1's stage-marker clear and base_ref record run
+                # before the artifact checks by design; neither names an
+                # artifact path.
+                "$bd_subcommand update ac-safe1 --unset-metadata handoff_stage" | \
+                "$bd_subcommand update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main")
+                    return 0
+                    ;;
                 "$bd_subcommand update "*)
                     fail "redirected artifact root reached a metadata update"
                     ;;
@@ -888,6 +912,16 @@ test_workspace_rejects_redirected_artifact_root_before_creation() {
         source "$setup"
     ); then
         fail "redirected artifact root did not stop workspace creation"
+    fi
+
+    grep -qxF "$bd_subcommand show ac-safe1 --json" "$calls" &&
+        [[ "$(tail -n 1 "$calls")" == "runtime drain-ack" ]] ||
+        fail "redirected artifact root test stopped before the artifact checks"
+    if grep "^${bd_subcommand} update " "$calls" |
+        grep -v -x -e "${bd_subcommand} update ac-safe1 --unset-metadata handoff_stage" \
+            -e "${bd_subcommand} update ac-safe1 --set-metadata base_ref=refs/remotes/origin/main" |
+        grep -q .; then
+        fail "redirected artifact root mutated work bead metadata"
     fi
 
     [[ ! -e "$redirected/worktrees" ]] ||
