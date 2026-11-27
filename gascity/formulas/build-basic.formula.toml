@@ -4,6 +4,16 @@ Default Gas City implementation of build-base.
 This concrete workflow uses the built-in Gas City requirement, design review,
 decomposition, implementation, review, and publish helpers while preserving the
 same full-lifecycle stage contract exposed by build-base.
+
+After publish opens or reuses a pull request (open_pr=true), the run waits for
+the PR's CI in a token-free exec check, sends red CI back to
+{{implementation_target}} for bounded fix rounds on the same branch, and
+squash-merges on green (or no CI) unless merge is false.
+
+CI gate inputs (used only when open_pr is true):
+- merge: {{merge}}
+- ci_fix_rounds: {{ci_fix_rounds}}
+- ci_timeout_minutes: {{ci_timeout_minutes}}
 """
 formula = "build-basic"
 version = 1
@@ -20,6 +30,18 @@ allowed_drain_policies = ["separate", "same-session"]
 implementation_strategy = "drain"
 interaction_modes = ["interactive", "autonomous", "headless"]
 review_modes = ["report", "agent", "interactive"]
+
+[vars.merge]
+description = "After green (or no) CI, squash-merge the PR and delete its branch. false leaves the PR open."
+default = "true"
+
+[vars.ci_fix_rounds]
+description = "Maximum red-CI fix rounds before the run fails (clamped to 0-10)."
+default = "3"
+
+[vars.ci_timeout_minutes]
+description = "How long each CI gate round waits for checks to finish, in minutes (clamped to 1-240)."
+default = "90"
 
 [[steps]]
 id = "requirements"
@@ -133,3 +155,32 @@ title = "Optionally publish build-basic"
 needs = ["finalize"]
 metadata = { "gc.run_target" = "gc.publisher" }
 description_file = "../assets/workflows/build-basic/publish.md"
+
+# CI gate: a check loop whose check (ci-gate.sh -> ci_gate.py wait) waits for
+# the PR's CI without a model, and whose subject is the fix round. Iteration 1
+# has no findings and closes as a no-op. The script ends the loop itself at
+# ci_fix_rounds; max_attempts is only the backstop for the clamp of 10.
+[[steps]]
+id = "ci-gate"
+title = "Wait for PR CI; fix red rounds on the same branch"
+needs = ["publish"]
+condition = "{{open_pr}}"
+metadata = { "gc.run_target" = "{{implementation_target}}" }
+description_file = "../assets/workflows/build-basic/ci-gate.md"
+
+[steps.check]
+max_attempts = 11
+
+[steps.check.check]
+mode = "exec"
+path = "../assets/scripts/checks/ci-gate.sh"
+# Above the 240-minute clamp; the script enforces the real per-round bound.
+timeout = "250m"
+
+[[steps]]
+id = "ci-merge"
+title = "Merge the PR when CI allows"
+needs = ["ci-gate"]
+condition = "{{open_pr}}"
+metadata = { "gc.run_target" = "gc.publisher" }
+description_file = "../assets/workflows/build-basic/ci-merge.md"

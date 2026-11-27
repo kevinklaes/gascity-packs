@@ -96,6 +96,10 @@ BUILD_BASE_STEPS = [
     "publish",
 ]
 
+# build-basic's post-publish CI gate and merge (both compiled in only with
+# open_pr=true). build-base and the derived packs do not have them.
+BUILD_BASIC_CI_STEPS = ["ci-gate", "ci-merge"]
+
 BUILD_FROM_REVIEW_STEPS = {
     "prepare-review",
     "review",
@@ -2050,7 +2054,7 @@ class FormulaAssetTests(unittest.TestCase):
         resolved = resolve_formula(root, "build-basic")
 
         self.assertEqual(data["extends"], ["build-base"])
-        self.assertEqual([step["id"] for step in resolved["steps"]], BUILD_BASE_STEPS)
+        self.assertEqual([step["id"] for step in resolved["steps"]], BUILD_BASE_STEPS + BUILD_BASIC_CI_STEPS)
         self.assertEqual(data["catalog"]["name"], "build-basic")
         review_step = next(step for step in data["steps"] if step["id"] == "review")
         self.assertEqual(review_step["expand"], "build-basic-review")
@@ -2104,6 +2108,49 @@ class FormulaAssetTests(unittest.TestCase):
         ):
             with self.subTest(step="decompose", fragment=fragment):
                 self.assertIn(fragment, decompose_description)
+
+    def test_build_basic_ci_gate_and_merge_steps(self) -> None:
+        root = pathlib.Path(__file__).resolve().parents[1]
+        data = load_formula(root, "build-basic")
+        steps = {step["id"]: step for step in data["steps"]}
+
+        self.assertEqual({k: data["vars"][k]["default"] for k in ("merge", "ci_fix_rounds", "ci_timeout_minutes")},
+                         {"merge": "true", "ci_fix_rounds": "3", "ci_timeout_minutes": "90"})
+        base = load_formula(root, "build-base")
+        for var_name in ("merge", "ci_fix_rounds", "ci_timeout_minutes"):
+            self.assertNotIn(var_name, base.get("vars", {}), "build-base and derived packs stay unchanged")
+
+        gate, merge = steps["ci-gate"], steps["ci-merge"]
+        self.assertEqual(gate["needs"], ["publish"])
+        self.assertEqual(merge["needs"], ["ci-gate"])
+        for step in (gate, merge):
+            with self.subTest(step=step["id"]):
+                self.assertEqual(step["condition"], "{{open_pr}}")
+        self.assertEqual(gate["metadata"]["gc.run_target"], "{{implementation_target}}")
+        self.assertEqual(merge["metadata"]["gc.run_target"], "gc.publisher")
+        self.assertEqual(gate["description_file"], "../assets/workflows/build-basic/ci-gate.md")
+        self.assertEqual(merge["description_file"], "../assets/workflows/build-basic/ci-merge.md")
+        self.assertEqual(gate["check"]["max_attempts"], 11)
+        self.assertEqual(gate["check"]["check"]["mode"], "exec")
+        self.assertEqual(gate["check"]["check"]["path"], "../assets/scripts/checks/ci-gate.sh")
+        self.assertEqual(gate["check"]["check"]["timeout"], "250m")
+        self.assertNotIn("check", merge)
+
+        fix = node_description(root, gate)
+        merge_text = node_description(root, merge)
+        self.assertIn("This step is this bead's explicit authorization to merge the pull request", merge_text)
+        self.assertIn("merge={{merge}}", merge_text)
+        self.assertIn('ci_gate.py merge --root', merge_text.replace('"$CI_GATE" ', "ci_gate.py "))
+        self.assertIn("search_paths", merge_text)
+        for fragment in ("same branch", "never force", "re-run", "empty commit", "ci_fix.action=noop",
+                         "ci_fix.action=pushed", "ci_fix.pushed_sha", "ci_fix.action=gave_up",
+                         "gc.build.pr_head_worktree=", "--ff-only", "findings file"):
+            with self.subTest(prompt="ci-gate.md", fragment=fragment):
+                self.assertIn(fragment, fix.lower() if fragment == "never force" else fix)
+        for label, text in (("ci-gate.md", fix), ("ci-merge.md", merge_text)):
+            for forbidden in ("gh pr", "gh api", "curl", "--force ", "push -f", "ScheduleWakeup", "sleep "):
+                with self.subTest(prompt=label, forbidden=forbidden):
+                    self.assertNotIn(forbidden, text)
 
     def test_build_basic_v2_uses_approachable_factory_techniques(self) -> None:
         root = pathlib.Path(__file__).resolve().parents[1]
@@ -4453,6 +4500,7 @@ description = "Override sink that writes the base triage report contract."
             [script.name for script in scripts],
             [
                 "build-artifact-valid.sh",
+                "ci-gate.sh",
                 "design-review-approved.sh",
                 "gap-analysis-approved.sh",
                 "implementation-review-approved.sh",
@@ -4501,6 +4549,7 @@ description = "Override sink that writes the base triage report contract."
             {script.name for script in referenced_checks},
             {
                 "build-artifact-valid.sh",
+                "ci-gate.sh",
                 "design-review-approved.sh",
                 "implementation-review-approved.sh",
             },
