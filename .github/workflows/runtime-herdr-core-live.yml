@@ -36,7 +36,8 @@ concurrency:
 jobs:
   live:
     name: herdr-core live (${{ matrix.lane }})
-    runs-on: ubuntu-24.04
+    if: github.server_url == 'https://github.com'
+    runs-on: ${{ vars.CI_RUNNER || 'ubuntu-24.04' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false

@@ -289,7 +289,7 @@ def test_live_tier_runs_both_lanes_and_fails_loudly() -> None:
     assert job["strategy"]["fail-fast"] is False
     assert job["env"]["GC_HC_LIVE"] == "1" and job["env"]["GC_HC_LIVE_LANE"] == "${{ matrix.lane }}"
     assert isinstance(job.get("timeout-minutes"), int)
-    assert job["runs-on"] == "ubuntu-24.04"
+    assert job["runs-on"] == "${{ vars.CI_RUNNER || 'ubuntu-24.04' }}"
     text = LIVE_WORKFLOW.read_text(encoding="utf-8")
     assert "continue-on-error" not in text, "a live failure must show as a failure"
     steps = _live_steps()

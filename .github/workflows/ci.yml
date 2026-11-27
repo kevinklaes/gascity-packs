@@ -84,6 +84,24 @@ jobs:
           GC_TEST_BIN="$(go env GOPATH)/bin/gc" \
             python3 -m pytest tests/test_gastown_lint_findings.py -q
 
+      - name: Ensure ripgrep for Gastown shell tests
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          if command -v rg >/dev/null 2>&1; then
+            echo "rg already present: $(rg --version | head -n 1)"
+            exit 0
+          fi
+          if [ "$(id -u)" -eq 0 ]; then
+            apt-get update -qq && apt-get install -y -qq --no-install-recommends ripgrep
+          elif command -v sudo >/dev/null 2>&1; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends ripgrep
+          else
+            echo "::error::rg is missing and cannot be installed (not root, no sudo)"
+            exit 1
+          fi
+          rg --version | head -n 1
+
       - name: Run Gastown shell tests
         run: |
           for test_script in gastown/tests/test_*.sh; do

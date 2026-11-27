@@ -79,6 +79,7 @@ jobs:
   inference:
     name: ${{ matrix.pack }} / ${{ matrix.gate }}
     needs: static-contracts
+    if: github.server_url == 'https://github.com'
     runs-on: ${{ vars.CI_RUNNER || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: ${{ matrix.timeout_minutes }}
     strategy:

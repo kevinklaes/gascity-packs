@@ -72,6 +72,7 @@ env:
 jobs:
   supported-pack-formulas:
     name: supported pack formula inference gates
+    if: github.server_url == 'https://github.com'
     runs-on: ${{ vars.CI_RUNNER || 'blacksmith-32vcpu-ubuntu-2404' }}
     timeout-minutes: 360
 
