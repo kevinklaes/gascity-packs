@@ -38,6 +38,51 @@ Never ask a human whether to proceed after a successful claim. Do not stop for
 confirmation in a headless workflow. If required task input is missing, record
 the bead's failure contract and close it instead of idling.
 
+## Long Commands
+
+A command that runs for minutes without output can look like a stalled
+session, and the controller may drain it and discard the work. Before any
+single command that may run longer than about five minutes without output
+(a full test suite, a long build, a large install or migration), take a
+heartbeat hold that covers its expected runtime plus a margin:
+
+```bash
+gc runtime heartbeat --duration 30m
+```
+
+The default duration is `45m`; values below `1m` or above `12h` are
+rejected. The hold applies to the current session; pass no session id.
+Each call replaces the previous hold. If the work may outlast it, or another
+long command follows, run `gc runtime heartbeat` again before it lapses.
+No command releases a hold; it expires on its own. When the long work ends
+with much of the hold left, shorten it with
+`gc runtime heartbeat --duration 1m` so a stale hold cannot hide a real
+stall.
+
+Short commands need no hold. Never hold while idle, while waiting for a
+human, or as a periodic keep-alive.
+
+A heartbeat failure does not block the work. Fix an out-of-range duration
+once; otherwise note the failure and run the command anyway. Never retry it
+in a loop, in the background, or with a scheduled wakeup.
+
+On a fresh or restarted session, before a full test suite, check the
+claimed bead's notes, metadata and comments (`gc bd show "$CLAIMED_BEAD_ID"`)
+for a recorded pass that names a commit sha. If `git rev-parse HEAD` starts
+with that sha and `git status --porcelain --untracked-files=no` prints
+nothing, cite the recorded pass and do not re-run the suite. Otherwise run
+it under a hold. If the claimed bead or its formula explicitly requires a
+fresh run, follow the bead and run it under a hold.
+
+When a full suite passes, record the command, the result and the full
+commit sha from `git rev-parse HEAD` on the claimed bead. Use
+`--append-notes`, never `--notes`, which replaces the existing notes:
+
+```bash
+gc bd update "$CLAIMED_BEAD_ID" \
+  --append-notes 'full suite (<command>) passed at <sha>'
+```
+
 ## Close
 
 Honor bead's requested `gc.outcome` metadata. If no failure contract exists,

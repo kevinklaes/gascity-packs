@@ -884,6 +884,58 @@ class FormulaAssetTests(unittest.TestCase):
             with self.subTest(city_specific=city_specific):
                 self.assertNotIn(city_specific, section)
 
+    def test_role_worker_holds_heartbeat_around_long_commands(self) -> None:
+        # A worker silent inside a long command looks stalled and is drained;
+        # its restart re-runs the same suite and is drained again. A heartbeat
+        # hold covers the command, and recorded evidence for the same commit
+        # stops the re-run.
+        root = pathlib.Path(__file__).resolve().parents[1]
+        text = (root / "template-fragments" / "gc-role-worker.template.md").read_text(encoding="utf-8")
+        self.assertLess(text.index("## Claim"), text.index("## Long Commands"))
+        raw = text[text.index("## Long Commands") : text.index("## Close")]
+        section = " ".join(raw.split())
+
+        for required in (
+            "gc runtime heartbeat --duration 30m",  # REQ-001, fenced example
+            "```bash",
+            "`45m`",  # default and bounds
+            "`1m`",
+            "`12h`",
+            "Each call replaces the previous hold",  # REQ-002
+            "No command releases a hold",  # REQ-003
+            "`gc runtime heartbeat --duration 1m`",
+            "A heartbeat failure does not block the work",  # REQ-004
+            "Never retry it in a loop",
+            "Never hold while idle",  # REQ-005
+            "periodic keep-alive",
+            "recorded pass that names a commit sha",  # REQ-006
+            "`git rev-parse HEAD`",
+            "`git status --porcelain --untracked-files=no`",
+            "explicitly requires a fresh run",  # REQ-008
+            "`--append-notes`, never `--notes`",  # REQ-007
+            'gc bd update "$CLAIMED_BEAD_ID"',
+        ):
+            with self.subTest(required=required):
+                self.assertIn(required, section)
+
+        # Public and upstream-shaped: no deployment names, bead ids or hosts,
+        # and every bead command goes through `gc bd`.
+        self.assertNotRegex(section, r"(?<!gc )\bbd\s+(?:update|close|heartbeat|show|list)\b")
+        for city_specific in (
+            "OpenCollab",
+            "homelab",
+            "gitea",
+            "Gitea",
+            "kevinklaes",
+            "ga-737",
+            "gp-yc3j",
+            "/Users/",
+            "/home/",
+            "--city",
+        ):
+            with self.subTest(city_specific=city_specific):
+                self.assertNotIn(city_specific, section)
+
     def test_role_worker_stops_on_non_clearing_bead_errors(self) -> None:
         # A claim whose bead read can never succeed (wrong store, missing bead)
         # must end in one report or one fail-close, not an unbounded retry
