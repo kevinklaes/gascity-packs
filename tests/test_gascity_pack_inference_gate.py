@@ -32,8 +32,16 @@ def gate_workspace(root: Path) -> gascity_pack_inference_gate.GateWorkspace:
     return workspace
 
 
-def _ci_runner_expr(label: str) -> str:
-    return f"${{{{ vars.CI_RUNNER || '{label}' }}}}"
+def _ci_runner_expr(label: str, *, big: bool = False) -> str:
+    prefix = "vars.CI_RUNNER_BIG || " if big else ""
+    return f"${{{{ {prefix}vars.CI_RUNNER || '{label}' }}}}"
+
+
+# Jobs that a fork may send to a larger runner through CI_RUNNER_BIG.
+CI_RUNNER_BIG_JOBS = {
+    (".github/workflows/ci.yml", "check"),
+    (".github/workflows/ci.yml", "runtime-herdr-core"),
+}
 
 
 def _runs_on(relative_path: str) -> dict[str, object]:
@@ -506,7 +514,8 @@ def test_ci_workflows_default_to_blacksmith_runner_labels() -> None:
     for relative_path, jobs in expected.items():
         runs_on = _runs_on(relative_path)
         for job_id, label in jobs.items():
-            assert runs_on[job_id] == _ci_runner_expr(label), f"{relative_path}:{job_id}"
+            big = (relative_path, job_id) in CI_RUNNER_BIG_JOBS
+            assert runs_on[job_id] == _ci_runner_expr(label, big=big), f"{relative_path}:{job_id}"
 
 
 def test_readme_includes_blacksmith_sponsor_badge() -> None:
