@@ -156,7 +156,9 @@ jobs:
   # downloads or runs a real herdr-core. Merges gate on the aggregator below.
   runtime-herdr-core:
     name: runtime-herdr-core (Python ${{ matrix.target }})
-    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-2vcpu-ubuntu-2404' }}
+    # Each run downloads gc's whole Go module graph; CI_RUNNER_BIG names a
+    # runner with room for it where one is set (see the Check job).
+    runs-on: ${{ vars.CI_RUNNER_BIG || vars.CI_RUNNER || 'blacksmith-2vcpu-ubuntu-2404' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false

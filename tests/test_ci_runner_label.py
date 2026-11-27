@@ -5,6 +5,10 @@ A fork without Blacksmith runners sets the ``CI_RUNNER`` repository variable
 to its own Blacksmith label. A bare Blacksmith label, or a ``CI_RUNNER``
 expression without a Blacksmith fallback, breaks one side of that contract.
 
+A job may put ``vars.CI_RUNNER_BIG ||`` in front (``${{ vars.CI_RUNNER_BIG ||
+vars.CI_RUNNER || '<blacksmith label>' }}``) so a fork can send it to a larger
+runner; unset, it behaves exactly like the plain expression.
+
 ``GITHUB_HOSTED_FALLBACKS`` names the jobs that fall back to a GitHub-hosted
 label instead: each must use ``${{ vars.CI_RUNNER || '<that label>' }}`` and
 nothing else. Only listed jobs may use a non-Blacksmith ``CI_RUNNER`` fallback.
@@ -21,7 +25,9 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS_DIR = REPO_ROOT / ".github" / "workflows"
 
-CI_RUNNER_PATTERN = re.compile(r"^\$\{\{ vars\.CI_RUNNER \|\| '(blacksmith-[0-9]+vcpu-ubuntu-2404)' \}\}$")
+CI_RUNNER_PATTERN = re.compile(
+    r"^\$\{\{ (?:vars\.CI_RUNNER_BIG \|\| )?vars\.CI_RUNNER \|\| '(blacksmith-[0-9]+vcpu-ubuntu-2404)' \}\}$"
+)
 
 # (workflow file, job id) -> the GitHub-hosted label its CI_RUNNER expression falls back to.
 GITHUB_HOSTED_FALLBACKS = {("runtime-herdr-core-live.yml", "live"): "ubuntu-24.04"}
@@ -118,6 +124,9 @@ def test_guard_sees_workflows_and_ci_runner_jobs() -> None:
         ("ubuntu-24.04", False),
         ("${{ vars.CI_RUNNER || 'blacksmith-32vcpu-ubuntu-2404' }}", False),
         ("${{ vars.CI_RUNNER || 'blacksmith-2vcpu-ubuntu-2404' }}", False),
+        ("${{ vars.CI_RUNNER_BIG || vars.CI_RUNNER || 'blacksmith-32vcpu-ubuntu-2404' }}", False),
+        ("${{ vars.CI_RUNNER_BIG || 'blacksmith-32vcpu-ubuntu-2404' }}", True),
+        ("${{ vars.CI_RUNNER_BIG || vars.CI_RUNNER }}", True),
     ],
 )
 def test_guard_classifies_runner_labels(runs_on: str, rejected: bool) -> None:
