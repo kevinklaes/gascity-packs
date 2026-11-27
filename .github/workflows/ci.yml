@@ -44,7 +44,16 @@ jobs:
         run: python3 validate_registry.py --require-git
 
       - name: Run Python pack tests
-        run: python3 -m pytest tests contributing-to-gascity/tests gascity/tests discord/tests github/tests oversight-rig/tests slack-full/tests slack-channel/tests pr-pipeline/tests profiler/tests runtime-herdr-core/tests/unit runtime-herdr-core/soak/tests gitea/tests -q
+        # One pytest process per suite: a single process across every suite
+        # grows past 3 GiB, which kills it on smaller self-hosted runners.
+        run: |
+          status=0
+          for suite in tests contributing-to-gascity/tests gascity/tests discord/tests github/tests oversight-rig/tests slack-full/tests slack-channel/tests pr-pipeline/tests profiler/tests runtime-herdr-core/tests/unit runtime-herdr-core/soak/tests gitea/tests; do
+            echo "::group::pytest $suite"
+            python3 -m pytest "$suite" -q || status=1
+            echo "::endgroup::"
+          done
+          exit "$status"
 
       - name: Lint and exercise shared role prompt composition
         run: |
