@@ -77,7 +77,10 @@ def fake_gitea(responder: Responder) -> Iterator[FakeGitea]:
             query = dict(urllib.parse.parse_qsl(parts.query))
             fake.log.append(Logged(self.command, parts.path, query, dict(self.headers.items()), body))
             status, payload, headers = fake.responder(self.command, parts.path, query, body)
-            data = json.dumps(payload).encode() if payload is not None else b""
+            if isinstance(payload, bytes):
+                data = payload
+            else:
+                data = json.dumps(payload).encode() if payload is not None else b""
             self.send_response(status)
             for key, value in headers.items():
                 self.send_header(key, value)
@@ -695,3 +698,189 @@ def test_script_runs_standalone_with_help() -> None:
     assert result.returncode == 0
     assert "--token-file" in result.stdout
     assert SCRIPT.stat().st_mode & stat.S_IXUSR
+
+
+# --------------------------------------------------------------------------
+# read and merge subcommands for build-basic's CI gate (ci-gate-merge REQ-004, REQ-009)
+
+PR7 = f"/api/v1/repos/{OWNER}/{REPO}/pulls/7"
+HEAD_SHA = "abc1234def5678abc1234def5678abc1234def56"
+STATUS_PATH = f"/api/v1/repos/{OWNER}/{REPO}/commits/{HEAD_SHA}/status"
+MERGE_PATH = f"{PR7}/merge"
+
+
+def pr7(state: str = "open", merged: bool = False, sha: str = HEAD_SHA) -> dict:
+    return {
+        "number": 7,
+        "state": state,
+        "merged": merged,
+        "html_url": f"http://gitea.test/{OWNER}/{REPO}/pulls/7",
+        "head": {"ref": "build/x", "sha": sha},
+    }
+
+
+def status(context: str, state: str, url: str = "", description: str = "") -> dict:
+    return {"context": context, "status": state, "target_url": url, "description": description}
+
+
+def read_argv(command: str, fake: FakeGitea, tok: Path, *extra: str) -> list[str]:
+    return [command, "--api-base", fake.url, "--owner", OWNER, "--repo", REPO, "--number", "7",
+            "--token-file", str(tok), *extra]
+
+
+def routes(table: dict) -> Responder:
+    """(method, path) -> response, or a list of responses popped in order (last one sticks)."""
+    def respond(method, path, query, body):
+        entry = table.get((method, path))
+        if entry is None:
+            return 404, {"message": "not found"}, {}
+        if isinstance(entry, list):
+            entry = entry.pop(0) if len(entry) > 1 else entry[0]
+        if callable(entry):
+            entry = entry(query, body)
+        status_code, payload = entry
+        return status_code, payload, {}
+    return respond
+
+
+@pytest.mark.parametrize(
+    ("pr", "expected"),
+    [(pr7(), "open"), (pr7("closed"), "closed"), (pr7("closed", merged=True), "merged")],
+)
+def test_pr_status_maps_state_and_head(tmp_path, pr, expected) -> None:
+    with fake_gitea(routes({("GET", PR7): (200, pr)})) as fake:
+        run = run_main(read_argv("pr-status", fake, token_file(tmp_path)))
+    assert run.code == 0, run.err
+    assert run.json["state"] == expected
+    assert run.json["head_sha"] == HEAD_SHA and run.json["head_ref"] == "build/x"
+    assert [entry.method for entry in fake.log] == ["GET"]
+    assert_secret_kept(run, fake)
+
+
+def test_ci_status_maps_every_context_state(tmp_path) -> None:
+    statuses = [
+        status("lint", "success"), status("warn", "warning"), status("skip", "skipped"),
+        status("queued", "pending"), status("test", "failure", "http://x/1", "boom\nline"),
+        status("infra", "error"), status("odd", "brand-new-state"),
+    ]
+    table = {("GET", PR7): (200, pr7()), ("GET", STATUS_PATH): (200, {"state": "failure", "statuses": statuses, "total_count": 7})}
+    with fake_gitea(routes(table)) as fake:
+        run = run_main(read_argv("ci-status", fake, token_file(tmp_path)))
+    assert run.code == 0, run.err
+    result = run.json
+    assert result["head_sha"] == HEAD_SHA and result["pr_state"] == "open"
+    assert {c["name"]: c["state"] for c in result["checks"]} == {
+        "lint": "pass", "warn": "pass", "skip": "pass", "queued": "pending",
+        "test": "fail", "infra": "fail", "odd": "fail",
+    }
+    test = next(c for c in result["checks"] if c["name"] == "test")
+    assert test["url"] == "http://x/1" and test["description"] == "boom line"
+    assert all(entry.method == "GET" for entry in fake.log), "ci-status must be read-only"
+    assert_secret_kept(run, fake)
+
+
+def test_ci_status_pages_past_fifty_statuses(tmp_path) -> None:
+    page1 = [status(f"job-{i}", "success") for i in range(50)]
+    page2 = [status("job-50", "failure")]
+
+    def statuses(query, body):
+        page = int(query.get("page", "1"))
+        items = page1 if page == 1 else page2 if page == 2 else []
+        return 200, {"state": "failure", "statuses": items, "total_count": 51}
+
+    with fake_gitea(routes({("GET", PR7): (200, pr7()), ("GET", STATUS_PATH): statuses})) as fake:
+        run = run_main(read_argv("ci-status", fake, token_file(tmp_path)))
+    assert run.code == 0, run.err
+    assert len(run.json["checks"]) == 51
+    assert [e.query.get("page") for e in fake.log if e.path == STATUS_PATH] == ["1", "2"]
+
+
+def test_ci_status_with_no_statuses_is_an_empty_list(tmp_path) -> None:
+    table = {("GET", PR7): (200, pr7()), ("GET", STATUS_PATH): (200, {"state": "", "statuses": [], "total_count": 0})}
+    with fake_gitea(routes(table)) as fake:
+        run = run_main(read_argv("ci-status", fake, token_file(tmp_path)))
+    assert run.code == 0 and run.json["checks"] == []
+
+
+@pytest.mark.parametrize("code", [401, 403, 404, 500])
+def test_ci_status_http_errors_map_to_codes(tmp_path, code) -> None:
+    with fake_gitea(routes({("GET", PR7): (code, {"message": f"nope {SENTINEL}"})})) as fake:
+        gitea_pr._SECRETS.add(SENTINEL)
+        run = run_main(read_argv("ci-status", fake, token_file(tmp_path)))
+    assert run.code == 2 and run.error["error"] == f"http_{code}"
+    assert_secret_kept(run, fake)
+
+
+def test_ci_log_tail_reads_the_job_log_and_caps_it(tmp_path) -> None:
+    log_lines = [f"line {i}" for i in range(200)] + [f"Authorization: token {SENTINEL}"]
+    table = {
+        ("GET", f"/api/v1/repos/{OWNER}/{REPO}/actions/runs/12/jobs"): (200, {"jobs": [{"id": 900}, {"id": 901}]}),
+        ("GET", f"/api/v1/repos/{OWNER}/{REPO}/actions/jobs/901/logs"): (200, "\n".join(log_lines).encode()),
+    }
+    with fake_gitea(routes(table)) as fake:
+        target = f"{fake.url}/{OWNER}/{REPO}/actions/runs/12/jobs/1"
+        run = run_main(read_argv("ci-log-tail", fake, token_file(tmp_path), "--target-url", target))
+    assert run.code == 0, run.err
+    tail = run.json["tail"]
+    assert len(tail.splitlines()) == 80
+    assert SENTINEL not in tail and "[REDACTED]" in tail
+    assert all(entry.method == "GET" for entry in fake.log)
+    assert_secret_kept(run, fake)
+
+
+def test_ci_log_tail_is_best_effort_on_404(tmp_path) -> None:
+    with fake_gitea(routes({})) as fake:
+        target = f"{fake.url}/{OWNER}/{REPO}/actions/runs/12/jobs/0"
+        run = run_main(read_argv("ci-log-tail", fake, token_file(tmp_path), "--target-url", target))
+    assert run.code == 0
+    assert run.json == {"tail": None, "reason": "http_404"}
+
+
+def test_ci_log_tail_refuses_a_foreign_host_before_reading_the_token(tmp_path) -> None:
+    with fake_gitea(routes({})) as fake:
+        argv = read_argv("ci-log-tail", fake, tmp_path / "absent.token",
+                         "--target-url", f"http://elsewhere.example/{OWNER}/{REPO}/actions/runs/1/jobs/0")
+        run = run_main(argv)
+    assert run.code == 2 and run.error["error"] == "target_url_foreign"
+    assert fake.log == []
+
+
+def merge_argv(fake: FakeGitea, tok: Path, *extra: str) -> list[str]:
+    return ["merge", "--origin", f"{fake.url}/{OWNER}/{REPO}.git", "--number", "7",
+            "--head-sha", HEAD_SHA, "--token-file", str(tok), *extra]
+
+
+def test_merge_posts_squash_delete_pinned_to_the_head_sha_once(tmp_path) -> None:
+    with fake_gitea(routes({("POST", MERGE_PATH): (200, None)})) as fake:
+        run = run_main(merge_argv(fake, token_file(tmp_path)))
+    assert run.code == 0, run.err
+    assert run.json["merged"] is True
+    assert [(e.method, e.path) for e in fake.log] == [("POST", MERGE_PATH)]
+    assert fake.log[0].body == {"Do": "squash", "delete_branch_after_merge": True, "head_commit_id": HEAD_SHA}
+    assert_secret_kept(run, fake)
+
+
+@pytest.mark.parametrize("code", [405, 409, 422])
+def test_merge_refusals_map_to_http_codes(tmp_path, code) -> None:
+    with fake_gitea(routes({("POST", MERGE_PATH): (code, {"message": "not mergeable"})})) as fake:
+        run = run_main(merge_argv(fake, token_file(tmp_path)))
+    assert run.code == 2 and run.error == {"error": f"http_{code}", "message": f"POST {MERGE_PATH}: not mergeable"}
+    assert_secret_kept(run, fake)
+
+
+def test_merge_has_no_api_base_flag_and_takes_its_base_from_origin_or_env(tmp_path) -> None:
+    run = run_main(["merge", "--api-base", "http://elsewhere.example", "--number", "7", "--head-sha", HEAD_SHA])
+    assert run.code == 2
+    with fake_gitea(routes({("POST", MERGE_PATH): (200, None)})) as fake:
+        argv = ["merge", "--origin", f"ssh://git@gitea.test/{OWNER}/{REPO}.git", "--number", "7",
+                "--head-sha", HEAD_SHA, "--token-file", str(token_file(tmp_path))]
+        run = run_main(argv, env={"GC_GITEA_BASE_URL": fake.url})
+    assert run.code == 0, run.err
+    assert len(fake.log) == 1
+
+
+@pytest.mark.parametrize("sha", ["", "not-a-sha", "abc"])
+def test_merge_validates_the_head_sha_before_reading_the_token(tmp_path, sha) -> None:
+    run = run_main(["merge", "--origin", f"http://gitea.test/{OWNER}/{REPO}.git", "--number", "7",
+                    "--head-sha", sha, "--token-file", str(tmp_path / "absent")])
+    assert run.code == 2 and run.error["error"] == "head_sha_invalid"

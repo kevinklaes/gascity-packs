@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Find or create a Gitea pull request for a pushed branch.
+"""Find, create, read and merge Gitea pull requests.
 
 This is the API half of the gitea pack's publish flow. The publish prompts
 push over SSH with plain git, then run `gc gitea open-pr`, which execs this
@@ -11,6 +11,19 @@ Subcommands:
                 Reads no token and makes no request.
   open-pr       Find an open PR for head -> base, or create one. Prints the
                 PR as JSON with `created` true or false.
+  pr-status     Read one PR: state (open, closed, merged), head sha and ref.
+  ci-status     Read one PR's head sha and that commit's statuses, mapped to
+                pending / pass / fail per context. Read-only.
+  ci-log-tail   Best effort: the tail of an Actions job log named by a status
+                target URL on the same host. Read-only.
+  merge         Squash-merge one PR and delete its branch, pinned to a head
+                sha. Its API base comes only from origin and
+                GC_GITEA_BASE_URL, never from a flag.
+
+pr-status, ci-status and ci-log-tail take an explicit --api-base, --owner and
+--repo, because build-basic's CI gate runs them with no checkout. merge takes
+the origin flags open-pr takes, so the Write token only ever goes to the
+server the checkout's origin names.
 
 Success prints one JSON object on stdout and exits 0. Failure prints one JSON
 line, `{"error": "<code>", "message": "<text>"}`, on stderr and exits 2.
@@ -58,6 +71,18 @@ TITLE_MAX = 255
 MESSAGE_MAX = 300
 DEFAULT_TIMEOUT = 30.0
 REDACTED = "[REDACTED]"
+LOG_TAIL_LINES = 80
+LOG_TAIL_BYTES = 8 * 1024
+
+# Per-context commit status -> gate state. Anything else fails closed.
+STATUS_STATES = {
+    "pending": "pending",
+    "success": "pass",
+    "warning": "pass",
+    "skipped": "pass",
+    "failure": "fail",
+    "error": "fail",
+}
 
 EXIT_ERROR = 2
 
@@ -355,17 +380,17 @@ class GiteaClient:
             headers["Content-Type"] = "application/json"
         return urllib.request.Request(url, data=data, headers=headers, method=method)
 
-    def call(
+    def call_raw(
         self,
         method: str,
         path: str,
         query: Mapping[str, Any] | None = None,
         body: Mapping[str, Any] | None = None,
-    ) -> Any:
+    ) -> bytes:
         request = self.build_request(method, path, query, body)
         try:
             with self._opener.open(request, timeout=self._timeout) as response:
-                payload = response.read()
+                return response.read()
         except urllib.error.HTTPError as exc:
             raise GiteaError(f"http_{exc.code}", f"{method} {path}: {_error_detail(exc)}") from None
         except urllib.error.URLError as exc:
@@ -373,6 +398,15 @@ class GiteaClient:
             raise GiteaError("api_error", f"{method} {path}: cannot reach {self.api_base} ({reason})") from None
         except (OSError, ValueError) as exc:
             raise GiteaError("api_error", f"{method} {path}: {type(exc).__name__}") from None
+
+    def call(
+        self,
+        method: str,
+        path: str,
+        query: Mapping[str, Any] | None = None,
+        body: Mapping[str, Any] | None = None,
+    ) -> Any:
+        payload = self.call_raw(method, path, query, body)
         if not payload:
             return None
         try:
@@ -403,6 +437,38 @@ class GiteaClient:
         if not isinstance(pr, dict):
             raise GiteaError("api_error", "POST pulls: expected a JSON object")
         return pr
+
+    def get_pr(self, owner: str, repo: str, number: int) -> dict:
+        pr = self.call("GET", self.repo_path(owner, repo, f"/pulls/{number}"))
+        if not isinstance(pr, dict):
+            raise GiteaError("api_error", f"GET pulls/{number}: expected a JSON object")
+        return pr
+
+    def commit_statuses(self, owner: str, repo: str, sha: str) -> tuple[str, list]:
+        """The combined state and every per-context status, paging past 50."""
+        path = self.repo_path(owner, repo, f"/commits/{urllib.parse.quote(sha, safe='')}/status")
+        statuses: list = []
+        combined = ""
+        for page in range(1, MAX_PAGES + 1):
+            data = self.call("GET", path, {"page": page, "limit": PAGE_LIMIT})
+            if not isinstance(data, dict):
+                raise GiteaError("api_error", f"GET {path}: expected a JSON object")
+            combined = combined or str(data.get("state") or "")
+            items = data.get("statuses") or []
+            if not isinstance(items, list):
+                raise GiteaError("api_error", f"GET {path}: statuses is not a list")
+            statuses.extend(items)
+            total = data.get("total_count")
+            if len(items) < PAGE_LIMIT or (isinstance(total, int) and len(statuses) >= total):
+                return combined, statuses
+        raise GiteaError("api_error", f"GET {path}: more than {MAX_PAGES} pages of statuses")
+
+    def merge_pr(self, owner: str, repo: str, number: int, head_sha: str) -> None:
+        self.call(
+            "POST",
+            self.repo_path(owner, repo, f"/pulls/{number}/merge"),
+            body={"Do": "squash", "delete_branch_after_merge": True, "head_commit_id": head_sha},
+        )
 
 
 def _error_detail(exc: urllib.error.HTTPError) -> str:
@@ -519,6 +585,159 @@ def cmd_open_pr(
     return pr_result(created, True, head, base, api_base, origin)
 
 
+def pr_state(pr: Mapping[str, Any]) -> str:
+    if pr.get("merged") is True:
+        return "merged"
+    return "open" if pr.get("state") == "open" else "closed"
+
+
+def pr_status_result(pr: Mapping[str, Any]) -> dict:
+    head = pr.get("head") if isinstance(pr.get("head"), dict) else {}
+    return {
+        "number": pr.get("number"),
+        "url": pr.get("html_url") or pr.get("url"),
+        "state": pr_state(pr),
+        "merged": pr.get("merged") is True,
+        "head_sha": head.get("sha"),
+        "head_ref": head.get("ref"),
+        "forge": "gitea",
+    }
+
+
+def _read_client(args: argparse.Namespace, env: Mapping[str, str], warn, opener) -> GiteaClient:
+    api_base = _normalize_base_url(args.api_base, "--api-base")
+    token = read_token(resolve_token_path(args.token_file, env), warn)
+    return GiteaClient(api_base, token, opener=opener, timeout=args.timeout)
+
+
+def _positive(number: int, flag: str) -> int:
+    if number <= 0:
+        raise GiteaError("number_invalid", f"{flag} must be a positive integer")
+    return number
+
+
+def map_status(item: Any) -> dict:
+    item = item if isinstance(item, dict) else {}
+    raw = str(item.get("status") or item.get("state") or "").lower()
+    return {
+        "name": " ".join(str(item.get("context") or "").split()) or "(unnamed)",
+        "state": STATUS_STATES.get(raw, "fail"),
+        "status": raw,
+        "url": item.get("target_url") or "",
+        "description": " ".join(str(item.get("description") or "").split())[:MESSAGE_MAX],
+    }
+
+
+def cmd_pr_status(args, env, git, warn, opener=None) -> dict:
+    number = _positive(args.number, "--number")
+    client = _read_client(args, env, warn, opener)
+    return pr_status_result(client.get_pr(args.owner, args.repo, number))
+
+
+def cmd_ci_status(args, env, git, warn, opener=None) -> dict:
+    number = _positive(args.number, "--number")
+    client = _read_client(args, env, warn, opener)
+    status = pr_status_result(client.get_pr(args.owner, args.repo, number))
+    head_sha = status["head_sha"]
+    if not head_sha:
+        raise GiteaError("api_error", f"GET pulls/{number}: no head sha")
+    combined, statuses = client.commit_statuses(args.owner, args.repo, head_sha)
+    return {
+        "pr_state": status["state"],
+        "head_sha": head_sha,
+        "head_ref": status["head_ref"],
+        "combined_state": combined,
+        "checks": [map_status(item) for item in statuses],
+        "forge": "gitea",
+    }
+
+
+JOB_URL = re.compile(r"/actions/runs/(?P<run>\d+)/jobs/(?P<job>\d+)/?$")
+
+
+def tail_text(text: str, lines: int = LOG_TAIL_LINES, limit: int = LOG_TAIL_BYTES) -> str:
+    tail = "\n".join(text.splitlines()[-lines:])
+    data = tail.encode("utf-8")
+    if len(data) > limit:
+        tail = data[-limit:].decode("utf-8", errors="ignore")
+    return tail
+
+
+def cmd_ci_log_tail(args, env, git, warn, opener=None) -> dict:
+    api_base = _normalize_base_url(args.api_base, "--api-base")
+    try:
+        target = urllib.parse.urlsplit(args.target_url or "")
+        base = urllib.parse.urlsplit(api_base)
+        same = (target.scheme, target.netloc.lower()) == (base.scheme, base.netloc.lower())
+    except ValueError:
+        same = False
+    if not same:
+        raise GiteaError("target_url_foreign", "--target-url is not on the --api-base host; refusing to send the token there")
+    prefix = base.path.rstrip("/") + f"/{args.owner}/{args.repo}"
+    match = JOB_URL.search(target.path)
+    if not target.path.startswith(prefix + "/") or not match:
+        return {"tail": None, "reason": "not_an_actions_job_url"}
+    client = _read_client(args, env, warn, opener)
+    try:
+        jobs = client.call("GET", client.repo_path(args.owner, args.repo, f"/actions/runs/{match.group('run')}/jobs"))
+        items = jobs.get("jobs") if isinstance(jobs, dict) else None
+        index = int(match.group("job"))
+        if not isinstance(items, list) or index >= len(items) or not isinstance(items[index], dict):
+            return {"tail": None, "reason": "job_not_found"}
+        job_id = items[index].get("id")
+        raw = client.call_raw("GET", client.repo_path(args.owner, args.repo, f"/actions/jobs/{job_id}/logs"))
+    except GiteaError as exc:
+        return {"tail": None, "reason": exc.code}
+    return {"tail": redact(tail_text(raw.decode("utf-8", errors="replace"))), "reason": None}
+
+
+def cmd_merge(
+    args: argparse.Namespace,
+    env: Mapping[str, str],
+    git: GitRunner,
+    warn: Callable[[str], None],
+    opener: urllib.request.OpenerDirector | None = None,
+) -> dict:
+    origin = parse_origin(resolve_origin_url(args.origin, args.cwd, git))
+    api_base = resolve_api_base(origin, args.base_url, env)
+    number = _positive(args.number, "--number")
+    head_sha = (args.head_sha or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{7,64}", head_sha):
+        raise GiteaError("head_sha_invalid", "--head-sha must be a hex commit sha")
+
+    # The only place the merge token is read, after every token-free check passed.
+    token = read_token(resolve_token_path(args.token_file, env), warn)
+    client = GiteaClient(api_base, token, opener=opener, timeout=args.timeout)
+    client.merge_pr(origin.owner, origin.repo, number, head_sha)
+    return {
+        "merged": True,
+        "number": number,
+        "head_sha": head_sha,
+        "api_base": api_base,
+        "owner": origin.owner,
+        "repo": origin.repo,
+        "forge": "gitea",
+    }
+
+
+# Looked up by name at call time, so tests can replace a command function.
+COMMANDS = {
+    "parse-origin": "cmd_parse_origin",
+    "open-pr": "cmd_open_pr",
+    "pr-status": "cmd_pr_status",
+    "ci-status": "cmd_ci_status",
+    "ci-log-tail": "cmd_ci_log_tail",
+    "merge": "cmd_merge",
+}
+
+
+def dispatch(args, env, git, warn, opener) -> dict:
+    command = globals()[COMMANDS[args.command]]
+    if args.command == "parse-origin":
+        return command(args, env, git, warn)
+    return command(args, env, git, warn, opener)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="gitea_pr.py",
@@ -542,6 +761,27 @@ def build_parser() -> argparse.ArgumentParser:
     open_pr.add_argument("--body-file", help="file holding the PR body")
     open_pr.add_argument("--token-file", help=f"token file (default: ${TOKEN_FILE_ENV}, else {DEFAULT_TOKEN_PATH})")
     open_pr.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="per-request timeout in seconds")
+
+    def read_flags(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--api-base", required=True, help="Gitea web base URL, e.g. https://gitea.example")
+        p.add_argument("--owner", required=True)
+        p.add_argument("--repo", required=True)
+        p.add_argument("--number", type=int, required=True, help="PR number")
+        p.add_argument("--token-file", help=f"token file (default: ${TOKEN_FILE_ENV}, else {DEFAULT_TOKEN_PATH})")
+        p.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="per-request timeout in seconds")
+
+    read_flags(sub.add_parser("pr-status", help="read one PR's state and head; read-only"))
+    read_flags(sub.add_parser("ci-status", help="read one PR's head commit statuses; read-only"))
+    log_tail = sub.add_parser("ci-log-tail", help="best-effort tail of an Actions job log on the same host")
+    read_flags(log_tail)
+    log_tail.add_argument("--target-url", required=True, help="a status target_url on the --api-base host")
+
+    merge = sub.add_parser("merge", help="squash-merge a PR at --head-sha and delete its branch")
+    common(merge)
+    merge.add_argument("--number", type=int, required=True, help="PR number")
+    merge.add_argument("--head-sha", required=True, help="merge only if the PR head is still this sha")
+    merge.add_argument("--token-file", help=f"token file (default: ${TOKEN_FILE_ENV}, else {DEFAULT_TOKEN_PATH})")
+    merge.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT, help="per-request timeout in seconds")
     return parser
 
 
@@ -572,10 +812,7 @@ def main(
     except SystemExit as exc:
         return int(exc.code or 0) and EXIT_ERROR
     try:
-        if args.command == "parse-origin":
-            result = cmd_parse_origin(args, env, git, warn)
-        else:
-            result = cmd_open_pr(args, env, git, warn, opener)
+        result = dispatch(args, env, git, warn, opener)
     except GiteaError as exc:
         return _emit_error(exc.code, exc.message, stderr)
     except Exception as exc:  # noqa: BLE001 -- never print a raw traceback
