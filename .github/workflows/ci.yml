@@ -12,7 +12,10 @@ permissions:
 jobs:
   check:
     name: Check
-    runs-on: ${{ vars.CI_RUNNER || 'blacksmith-32vcpu-ubuntu-2404' }}
+    # The full suite needs more memory than a small self-hosted slot.
+    # CI_RUNNER_BIG names a larger runner where one is set; unset, this
+    # falls back to CI_RUNNER and then the hosted default as before.
+    runs-on: ${{ vars.CI_RUNNER_BIG || vars.CI_RUNNER || 'blacksmith-32vcpu-ubuntu-2404' }}
     steps:
       - name: Check out repository
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
