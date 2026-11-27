@@ -248,3 +248,38 @@ def test_every_command_points_at_an_executable_wrapper() -> None:
         text = wrapper.read_text(encoding="utf-8")
         assert 'GC_PACK_DIR' in text and "assets/scripts/gitea_pr.py" in text
         assert f"gitea_pr.py\" {command.parent.name}" in text
+
+
+# build-basic's CI gate prompts are not shadowed: all forge logic lives in
+# gascity's ci_gate.py (which calls this pack's gitea_pr.py). If someone adds a
+# gh or HTTP command to them, a gitea rig would reach for GitHub, so they must
+# stay forge-neutral or gain a shadow here.
+CI_PROMPTS = ("workflows/build-basic/ci-gate.md", "workflows/build-basic/ci-merge.md")
+
+
+@pytest.mark.parametrize("rel", CI_PROMPTS)
+def test_ci_prompts_are_forge_neutral(rel: str) -> None:
+    text = read(GASCITY_ASSETS, rel)
+    for pattern, label in FORBIDDEN:
+        match = pattern.search(text)
+        assert match is None, f"gascity assets/{rel} contains {label}: {match.group(0)!r}; shadow it in the gitea pack"
+    assert not GITEA_ASSETS.joinpath(rel).exists(), f"{rel} is forge-neutral and needs no gitea shadow"
+
+
+def test_build_basic_shadow_records_the_ci_gate_keys() -> None:
+    text = read(GITEA_ASSETS, "workflows/build-basic/publish.md")
+    step7 = section(text, "7. Record the result")
+    for key in (
+        "gc.build.pr_head_branch=",
+        "gc.build.pr_head_worktree=",
+        "gc.build.publish_api_base=",
+        "gc.build.publish_owner=",
+        "gc.build.publish_repo=",
+    ):
+        assert key in step7, f"step 7 lacks {key!r}"
+    for name, body in {
+        "disabled": text[: text.index("\n## Inputs")],
+        "push only": section(text, "3. Stop here"),
+        "failure": section(text, "6. Failure handling"),
+    }.items():
+        assert "gc.build.merge_status=skipped:no_pr" in body, f"the {name} path does not record skipped:no_pr"

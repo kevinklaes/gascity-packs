@@ -34,8 +34,9 @@ gc bd close "$CLAIMED_BEAD_ID" --reason 'Publishing disabled; build-basic result
 
 For that disabled case, also record the workflow root metadata from step 7
 with `gc.build.publish_status=noop`, `gc.build.publish_action=noop` and a reason
-such as `push=false_open_pr=false`. Do not read the token file and do not call
-the Gitea API.
+such as `push=false_open_pr=false`, plus `gc.build.merge_status=skipped:no_pr`
+(no PR, so build-basic's CI gate and merge have nothing to do). Do not read the
+token file and do not call the Gitea API.
 
 ## Inputs
 
@@ -110,7 +111,7 @@ If `open_pr` is false, stop after the push. Record
 `gc.build.publish_action=push`, `gc.build.publish_status=published`,
 `gc.publish_outcome=pushed` and `gc.publish_mode=push`. Do not run the script's
 `open-pr` subcommand, so the token is never read. Write no PR keys on the
-workflow root.
+workflow root; record `gc.build.merge_status=skipped:no_pr` there instead.
 
 ## 4. Prepare the title and body
 
@@ -162,8 +163,9 @@ gc bd update "$CLAIMED_BEAD_ID" \
 ```
 
 and on the workflow root `gc.build.publish_status=failed`,
-`gc.build.publish_action=failed`, and the error code plus token-free message
-as `gc.build.publish_reason`. Never fall back to `gh` or GitHub.
+`gc.build.publish_action=failed`, `gc.build.merge_status=skipped:no_pr`, and
+the error code plus token-free message as `gc.build.publish_reason`. Never fall
+back to `gh` or GitHub.
 
 ## 7. Record the result
 
@@ -202,6 +204,13 @@ these, with `gc.build.publish_status=published` and
 - `gc.build.publish_pr_url=<url from the script>` (gitea pack addition)
 - `gc.build.publish_pr_number=<number from the script>` (gitea pack addition)
 - `gc.build.publish_forge=gitea` (gitea pack addition)
+- `gc.build.pr_head_branch=<head branch>` and
+  `gc.build.pr_head_worktree=<absolute path of the head branch's worktree>`
+  (build-basic's CI fix rounds push there)
+- `gc.build.publish_api_base=<api_base>`, `gc.build.publish_owner=<owner>` and
+  `gc.build.publish_repo=<repo>`, from the script's JSON (build-basic's CI gate
+  reads the PR's statuses there; its merge checks the checkout's origin still
+  names this repo)
 
 For example, with the root id from this step's `gc.root_bead_id`:
 
@@ -212,11 +221,17 @@ gc bd update "<workflow-root-id>" \
   --set-metadata 'gc.build.publish_pr_url=<url>' \
   --set-metadata 'gc.build.publish_pr_number=<number>' \
   --set-metadata 'gc.build.publish_forge=gitea' \
+  --set-metadata 'gc.build.pr_head_branch=<head branch>' \
+  --set-metadata 'gc.build.pr_head_worktree=<worktree path>' \
+  --set-metadata 'gc.build.publish_api_base=<api_base>' \
+  --set-metadata 'gc.build.publish_owner=<owner>' \
+  --set-metadata 'gc.build.publish_repo=<repo>' \
   --set-metadata 'gc.build.publish_status=published' \
   --set-metadata 'gc.build.publish_action=push_pr'
 ```
 
-Push-only, no-op and failed publishes write none of the PR keys.
+Push-only, no-op and failed publishes write none of the PR keys; they record
+`gc.build.merge_status=skipped:no_pr` instead.
 
 The final report's publish fields use the same names as the gascity flow. When
 a PR was opened or reused, close with its URL and state:

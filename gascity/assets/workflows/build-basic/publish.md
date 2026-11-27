@@ -21,4 +21,26 @@ gc bd update "$CLAIMED_BEAD_ID" \
 gc bd close "$CLAIMED_BEAD_ID" --reason 'Publishing disabled; build-basic result approved.'
 ```
 
+## Record the PR on the workflow root
+
+build-basic's `ci-gate` and `ci-merge` steps read the PR from the workflow root
+(this step's `gc.root_bead_id`). When the publish helper opened a pull request
+or reused an open one, record:
+
+```bash
+gc bd update "<workflow-root-id>" \
+  --set-metadata 'gc.build.pr_url=<PR URL>' \
+  --set-metadata 'gc.build.pr_number=<PR number, the bare integer>' \
+  --set-metadata 'gc.build.publish_forge=github' \
+  --set-metadata 'gc.build.pr_head_branch=<PR head branch>' \
+  --set-metadata 'gc.build.pr_head_worktree=<absolute path of the worktree on that branch>'
+```
+
+When this step ends without a pull request (publishing disabled, push only, or
+a failed publish), record none of those keys and record instead:
+
+```bash
+gc bd update "<workflow-root-id>" --set-metadata 'gc.build.merge_status=skipped:no_pr'
+```
+
 Close only after the push, PR creation, or no-op publish result is recorded.
